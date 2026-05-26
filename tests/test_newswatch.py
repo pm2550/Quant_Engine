@@ -510,3 +510,87 @@ def test_cluster_cooldown_ignores_old_pushed(monkeypatch, tmp_path):
     assert newswatch._find_recent_pushed_cluster(
         {"title": "x"}, {"reasoning": "y"}
     ) is None
+
+
+# ---- Heuristic (embedding-free) cluster dedup ----
+
+
+def test_heuristic_cluster_catches_high_symbol_overlap(monkeypatch, tmp_path):
+    """Same category + 50%+ symbol overlap within 4h window → dedup."""
+    from quant import db
+    from datetime import datetime
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "heur1.sqlite")
+    db.init()
+    now = datetime.utcnow().isoformat() + "Z"
+    with db.conn() as c:
+        cur = c.execute("INSERT INTO events(severity, category, summary, fired_at, "
+                         "pushed_at, affected_symbols) VALUES (8, 'policy', 'earlier', ?, ?, ?)",
+                         (now, now, "VOO,QQQ,AMD,NVDA"))
+        prior_id = cur.lastrowid
+
+    cluster = newswatch._find_recent_pushed_cluster_heuristic(
+        severity_info={"category": "policy"},
+        impact={"impacts": [{"symbol": "VOO"}, {"symbol": "QQQ"}, {"symbol": "AMD"}]},
+        event_id=prior_id + 1,
+    )
+    assert cluster is not None
+    assert cluster["event_id"] == prior_id
+    assert cluster["via"] == "heuristic"
+
+
+def test_heuristic_cluster_ignores_different_category(monkeypatch, tmp_path):
+    """Different category should not dedup even with full symbol overlap."""
+    from quant import db
+    from datetime import datetime
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "heur2.sqlite")
+    db.init()
+    now = datetime.utcnow().isoformat() + "Z"
+    with db.conn() as c:
+        c.execute("INSERT INTO events(severity, category, summary, fired_at, "
+                   "pushed_at, affected_symbols) VALUES (8, 'policy', 'p', ?, ?, ?)",
+                   (now, now, "VOO,QQQ,AMD"))
+
+    assert newswatch._find_recent_pushed_cluster_heuristic(
+        severity_info={"category": "geopolitical"},
+        impact={"impacts": [{"symbol": "VOO"}, {"symbol": "QQQ"}, {"symbol": "AMD"}]},
+        event_id=99,
+    ) is None
+
+
+def test_heuristic_cluster_ignores_low_overlap(monkeypatch, tmp_path):
+    """<50% overlap should not dedup."""
+    from quant import db
+    from datetime import datetime
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "heur3.sqlite")
+    db.init()
+    now = datetime.utcnow().isoformat() + "Z"
+    with db.conn() as c:
+        c.execute("INSERT INTO events(severity, category, summary, fired_at, "
+                   "pushed_at, affected_symbols) VALUES (8, 'policy', 'p', ?, ?, ?)",
+                   (now, now, "VOO,QQQ,AMD,NVDA,SOXX,ARM"))
+
+    # impact has only 1 symbol matching 1 of 6 past → 1/6 = 0.17 overlap
+    assert newswatch._find_recent_pushed_cluster_heuristic(
+        severity_info={"category": "policy"},
+        impact={"impacts": [{"symbol": "VOO"}]},
+        event_id=99,
+    ) is None
+
+
+def test_heuristic_cluster_ignores_outside_window(monkeypatch, tmp_path):
+    """Past event >4h ago should not trigger heuristic dedup."""
+    from quant import db
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "heur4.sqlite")
+    db.init()
+    old = (datetime.utcnow() - timedelta(hours=5)).isoformat() + "Z"
+    with db.conn() as c:
+        c.execute("INSERT INTO events(severity, category, summary, fired_at, "
+                   "pushed_at, affected_symbols) VALUES (8, 'policy', 'p', ?, ?, ?)",
+                   (old, old, "VOO,QQQ,AMD"))
+
+    assert newswatch._find_recent_pushed_cluster_heuristic(
+        severity_info={"category": "policy"},
+        impact={"impacts": [{"symbol": "VOO"}, {"symbol": "QQQ"}, {"symbol": "AMD"}]},
+        event_id=99,
+    ) is None

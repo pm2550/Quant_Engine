@@ -218,6 +218,8 @@ def _build_similar_history(item: dict, severity_info: dict, top_k: int = 3) -> s
 # ---- Cluster de-dup: skip events too similar to one already pushed in last N hours ----
 CLUSTER_SIM_THRESHOLD = 0.7
 CLUSTER_COOLDOWN_HOURS = 24
+HEURISTIC_WINDOW_HOURS = 4
+HEURISTIC_OVERLAP_MIN = 0.5
 
 
 def _find_recent_pushed_cluster(item: dict, severity_info: dict) -> dict | None:
@@ -253,6 +255,43 @@ def _find_recent_pushed_cluster(item: dict, severity_info: dict) -> dict | None:
             if pushed_dt >= cutoff:
                 return {"event_id": s["event_id"], "similarity": s["similarity"],
                         "pushed_at": row["pushed_at"], "summary": s.get("summary")}
+    return None
+
+
+def _find_recent_pushed_cluster_heuristic(severity_info: dict, impact: dict,
+                                           event_id: int) -> dict | None:
+    """Embedding-free fallback dedup: same category + recent + symbol overlap.
+
+    Why: when Gemini embed API is unavailable (key blocked / quota) the
+    similarity-based dedup silently returns None and lets duplicates through.
+    This catches the obvious clusters (same category, 4h window, ≥50% symbol
+    overlap) without needing any LLM call.
+    """
+    cat = severity_info.get("category")
+    if not cat:
+        return None
+    impacts = impact.get("impacts") or []
+    affected = {x.get("symbol") for x in impacts if x.get("symbol")}
+    if not affected:
+        return None
+    cutoff = datetime.utcnow() - timedelta(hours=HEURISTIC_WINDOW_HOURS)
+    with sqlite3.connect(db.DB_PATH, timeout=30) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, affected_symbols, pushed_at, summary FROM events "
+            "WHERE pushed_at IS NOT NULL AND category=? AND pushed_at>=? "
+            "AND id != ? ORDER BY pushed_at DESC LIMIT 20",
+            (cat, cutoff.isoformat() + "Z", event_id),
+        ).fetchall()
+    for r in rows:
+        past = {s for s in (r["affected_symbols"] or "").split(",") if s}
+        if not past:
+            continue
+        overlap = len(past & affected) / max(len(past | affected), 1)
+        if overlap >= HEURISTIC_OVERLAP_MIN:
+            return {"event_id": r["id"], "similarity": round(overlap, 2),
+                    "pushed_at": r["pushed_at"], "summary": r["summary"],
+                    "via": "heuristic"}
     return None
 
 
@@ -534,11 +573,13 @@ def process_item(news_id: int, item: dict, kw_cfg: dict, push_threshold: int) ->
         # Cluster cooldown: don't see-saw on the same narrative within 24h.
         # Skip push if a similar event (sim >= 0.7) was already pushed in the cooldown window.
         cluster = _find_recent_pushed_cluster(item, sev_info)
+        if not cluster:
+            cluster = _find_recent_pushed_cluster_heuristic(sev_info, impact, event_id)
         if cluster:
             log.info("event #%d suppressed by cluster cooldown — similar to "
-                      "event #%d (sim %.2f) pushed at %s",
+                      "event #%d (sim %.2f via %s) pushed at %s",
                       event_id, cluster["event_id"], cluster["similarity"],
-                      cluster["pushed_at"])
+                      cluster.get("via", "embedding"), cluster["pushed_at"])
             return {"event_id": event_id, "severity": sev_info["severity"],
                     "cluster_skipped": cluster}
         try:
