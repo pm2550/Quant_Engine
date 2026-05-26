@@ -16,7 +16,7 @@ from .config import PRICES_DIR
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LOOKBACK_YEARS = 10
+DEFAULT_LOOKBACK_YEARS = 20
 
 
 def _path(symbol: str) -> Path:
@@ -27,9 +27,9 @@ def is_a_share(symbol: str) -> bool:
     return symbol.upper().endswith((".SS", ".SZ"))
 
 
-def _akshare_fetch(symbol: str, start: date) -> pd.DataFrame:
-    """Fetch A-share data via akshare. symbol like '002624.SZ' or '600519.SS'."""
-    import akshare as ak  # imported lazily so US-only setups don't need it
+def _akshare_fetch_em(symbol: str, start: date):
+    """East-money endpoint — fast + full columns but flaky on large windows."""
+    import akshare as ak
     code = symbol.split(".")[0]
     df = ak.stock_zh_a_hist(
         symbol=code,
@@ -51,6 +51,45 @@ def _akshare_fetch(symbol: str, start: date) -> pd.DataFrame:
     df = df.set_index("date").sort_index()
     keep = [c for c in ["open", "high", "low", "close", "volume", "turnover", "turnover_rate"] if c in df.columns]
     return df[keep].astype(float)
+
+
+def _akshare_fetch_sina(symbol: str, start: date):
+    """Sina endpoint — fallback when east-money is blocked / disconnects."""
+    import akshare as ak
+    code = symbol.split(".")[0]
+    suffix = "sz" if symbol.upper().endswith(".SZ") else "sh"
+    df = ak.stock_zh_a_daily(
+        symbol=f"{suffix}{code}",
+        adjust="qfq",
+        start_date=start.strftime("%Y%m%d"),
+        end_date=date.today().strftime("%Y%m%d"),
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Sina columns: date, open, high, low, close, volume, amount, outstanding_share, turnover
+    # Map to east-money schema: amount → turnover (成交额); sina's "turnover" → turnover_rate (换手率)
+    df = df.rename(columns={"amount": "turnover", "turnover": "turnover_rate"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    keep = [c for c in ["open", "high", "low", "close", "volume", "turnover", "turnover_rate"] if c in df.columns]
+    return df[keep].astype(float)
+
+
+def _akshare_fetch(symbol: str, start: date) -> pd.DataFrame:
+    """Fetch A-share data via akshare. symbol like '002624.SZ' or '600519.SS'.
+
+    Tries east-money first (more columns, faster); falls back to Sina if EM
+    drops the connection or returns empty (a recurring issue with EM's free
+    endpoint on multi-year windows).
+    """
+    try:
+        df = _akshare_fetch_em(symbol, start)
+        if not df.empty:
+            return df
+        log.warning("akshare EM returned empty for %s; trying Sina", symbol)
+    except Exception as e:  # noqa: BLE001
+        log.warning("akshare EM failed for %s (%s); trying Sina", symbol, e)
+    return _akshare_fetch_sina(symbol, start)
 
 
 def _yfinance_fetch(symbol: str, start: date) -> pd.DataFrame:
