@@ -1,0 +1,57 @@
+# Personal portfolio + watchlist + risk params.
+# COPY THIS to portfolio.yaml and fill in real values.
+# portfolio.yaml is gitignored to avoid committing personal holdings + chat IDs.
+
+owner: your_handle
+telegram_target: 'YOUR_TELEGRAM_CHAT_ID'  # e.g. integer or "@channelname"
+default_currency: USD
+
+positions:
+  # US stocks: symbol = ticker
+  AMD:
+    shares: 0.5
+    currency: USD
+    name: Advanced Micro Devices
+    theme: ai_compute
+
+  # ETFs (also get analyst ratings via top-10 weighted constituent rec_mean)
+  VOO:
+    shares: 1.0
+    currency: USD
+    name: Vanguard S&P 500 ETF
+    theme: broad_market
+
+  # A-share: symbol = "<code>.SZ" or "<code>.SS" (akshare fetcher)
+  002624.SZ:
+    shares: 100
+    currency: CNY
+    name: 完美世界
+    theme: cn_gaming
+    market: a_share
+    # Optional: link to alt_data_metrics keyword for B 站舆情 factor.
+    # multi_factor._alt_data_score reads this to pull sentiment + buzz_phase.
+    alt_data_keyword: 异环
+
+watchlist:
+  - symbol: NVDA
+    currency: USD
+    theme: ai_compute
+    reason: AI 算力龙头
+  - symbol: PLTR
+    currency: USD
+    theme: ai_software
+    reason: AI 软件应用层
+
+risk:
+  stop_loss_pct: -0.15
+  take_profit_pct: 0.3
+  position_concentration_max: 0.3
+  intraday_move_alert_pct: 0.05
+
+sector_overlap:
+  semiconductor:
+    - SOXX
+    - SMH
+  ai_infra:
+    - SOXX
+    - SMH

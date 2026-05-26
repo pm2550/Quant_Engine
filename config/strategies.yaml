@@ -1,0 +1,50 @@
+# 信号阈值配置 - 信号汇总器用这个判断"操作建议"
+indicators:
+  rsi:
+    overbought: 70
+    oversold: 30
+    extreme_overbought: 80
+    extreme_oversold: 20
+
+  macd:
+    enabled: true
+
+  bollinger:
+    period: 20
+    std: 2
+
+  ma:
+    short: 20
+    medium: 50
+    long: 200
+
+  atr:
+    period: 14
+
+# 信号 → 操作建议的映射
+action_rules:
+  # 加仓信号（多个条件加权打分）
+  buy:
+    require_any:
+      - "macd_cross_up_above_zero"
+      - "break_ma200_with_volume"
+      - "rsi_oversold_reversal"
+    require_all_filters:
+      - "above_ma50"            # 不在主下跌趋势中
+
+  # 减仓信号
+  reduce:
+    require_any:
+      - "rsi_extreme_overbought"
+      - "break_bb_upper"
+      - "macd_cross_down_below_zero"
+
+  # 止损（强制建议）
+  stop_loss:
+    pnl_pct: -0.15
+    or_breach_ma200: true       # 跌破 200 日线也触发
+
+  # 止盈（柔性建议）
+  take_profit:
+    pnl_pct: 0.30
+    or_rsi_above: 80

@@ -1,0 +1,82 @@
+# 行业大型活动 / Investor Day - 手动维护
+# 这些事件影响股价但 yfinance 不提供, 需 manual seed
+# 添加新事件时只需新增条目, daily 报告会自动识别 7 天内的
+
+events:
+  # NVIDIA
+  - symbol: NVDA
+    name: "NVIDIA GTC (GPU Technology Conference)"
+    date: "2026-03-17"
+    end_date: "2026-03-20"
+    type: "industry_conference"
+    impact: high
+    notes: "Jensen Huang keynote, 通常发布新 GPU/CUDA 战略, 历史 NVDA ±5%+"
+
+  - symbol: NVDA
+    name: "NVIDIA Q1 FY27 Earnings"
+    date: "2026-05-20"
+    type: "earnings"
+    impact: high
+
+  # Apple
+  - symbol: AAPL
+    name: "Apple WWDC 2026"
+    date: "2026-06-08"
+    end_date: "2026-06-12"
+    type: "industry_conference"
+    impact: high
+    notes: "Worldwide Developers Conference, 软件战略发布"
+
+  # AMD
+  - symbol: AMD
+    name: "AMD Computex Keynote"
+    date: "2026-06-02"
+    type: "industry_conference"
+    impact: high
+    notes: "Lisa Su 通常 Computex 发新 CPU/GPU"
+
+  # Tesla
+  - symbol: TSLA
+    name: "Tesla Robotaxi Day"
+    date: "2026-08-08"
+    type: "investor_day"
+    impact: high
+    notes: "FSD/Robotaxi 战略, 历史一日 ±15%"
+
+  # Broadcom
+  - symbol: AVGO
+    name: "Broadcom Investor Day"
+    date: "2026-12-10"
+    type: "investor_day"
+    impact: medium
+
+  # 完美世界 - A股
+  - symbol: 002624.SZ
+    name: "完美世界 异环 国服正式公测"
+    date: "2026-04-29"
+    type: "product_launch"
+    impact: high
+    notes: "海外 4/29 已上线, 国服等待版号"
+
+  # Macro / 跨多股
+  - symbol: __MACRO__
+    name: "中央经济工作会议"
+    date: "2026-12-08"
+    type: "policy"
+    impact: high
+    notes: "下年度宏观政策定调, 中国市场 ±3%"
+
+  - symbol: __MACRO__
+    name: "Davos World Economic Forum"
+    date: "2026-01-19"
+    end_date: "2026-01-23"
+    type: "policy"
+    impact: medium
+
+  - symbol: __MACRO__
+    name: "Jackson Hole Economic Symposium"
+    date: "2026-08-21"
+    end_date: "2026-08-23"
+    type: "policy"
+    impact: high
+    notes: "Powell 通常此处放鸽派/鹰派信号, 跨市场"

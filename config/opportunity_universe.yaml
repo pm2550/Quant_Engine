@@ -1,0 +1,78 @@
+# Opportunity scanner candidate universe.
+# Phase C (2026-05-26): 每天 14:00 UTC 扫一遍, 对 multi_factor composite>=0.30 且不在
+# portfolio.yaml positions/watchlist 的标的, 推 "新机会" TG.
+#
+# 维护原则: 控制在 ~25 只以内 (避免噪音 + 数据维护成本). 优先主人感兴趣的赛道.
+
+universe:
+  # AI / 半导体 (跟现有持仓 SOXX/AMD/NVDA 同主题, 寻找未持仓的赛道补充)
+  - symbol: META
+    theme: ai_software
+    reason: 大型 AI infra 客户 + LLAMA 模型
+  - symbol: GOOG
+    theme: ai_software
+    reason: Gemini + TPU 自研芯片
+  - symbol: MSFT
+    theme: ai_software
+    reason: OpenAI 投资人 + Copilot
+  - symbol: AAPL
+    theme: ai_software
+    reason: Apple Intelligence + 自研芯片
+  - symbol: ORCL
+    theme: ai_software
+    reason: OCI AI 云
+  - symbol: AMZN
+    theme: ai_software
+    reason: AWS Bedrock + Trainium
+  - symbol: MU
+    theme: ai_memory
+    reason: HBM 内存龙头 (持仓有 DRAM ETF 但无个股)
+  - symbol: ASML
+    theme: ai_compute
+    reason: EUV 光刻独占
+  - symbol: TSM
+    theme: ai_compute
+    reason: 全球最大代工厂
+  - symbol: SMCI
+    theme: ai_compute
+    reason: AI 服务器组装龙头
+  - symbol: DELL
+    theme: ai_compute
+    reason: AI 服务器 + 数据中心
+  - symbol: ANET
+    theme: ai_compute
+    reason: AI 数据中心网络
+  - symbol: CRWD
+    theme: cyber
+    reason: 头部 AI 驱动安全
+  - symbol: SNOW
+    theme: ai_software
+    reason: 数据平台 + AI
+  # 高 conviction 中盘成长
+  - symbol: COIN
+    theme: crypto
+    reason: 加密交易龙头, 跟 BTC 周期
+  - symbol: SHOP
+    theme: ecommerce
+    reason: 电商 SaaS
+  - symbol: NET
+    theme: cyber
+    reason: Cloudflare AI 边缘
+  - symbol: ABNB
+    theme: consumer
+    reason: 旅游科技
+  - symbol: UBER
+    theme: consumer
+    reason: 出行平台 + AI 调度
+  # 大消费 / 防御 (在风险偏好转保守时给候选)
+  - symbol: COST
+    theme: consumer
+    reason: 抗周期消费
+  - symbol: WMT
+    theme: consumer
+    reason: 巨型零售 + 价值股
+
+# 同一标的 24h 内不重推; 主人回复 /ignore SYM 30 天忽略 (写入下面 ignore list)
+ignore:
+  # symbol: ignore_until_iso_date
+  # 例: NET: 2026-06-15  (临时忽略到该日期)

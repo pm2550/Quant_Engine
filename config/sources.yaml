@@ -1,0 +1,235 @@
+# 数据源集中注册 - newswatch / audio_discovery / 各 Phase 共用
+# fetch_interval_seconds: 0 = 一次性, >0 = 周期轮询
+
+# ===== RSS 新闻源 (newswatch) =====
+rss_feeds:
+  # 国际时政/突发
+  - name: reuters_world
+    url: https://feeds.reuters.com/Reuters/worldNews
+    region: global
+    weight: 1.0
+    fetch_interval_seconds: 600
+
+  - name: reuters_business
+    url: https://feeds.reuters.com/reuters/businessNews
+    region: global
+    weight: 1.0
+    fetch_interval_seconds: 600
+
+  - name: ap_top
+    url: https://apnews.com/index.rss
+    region: global
+    weight: 0.8
+    fetch_interval_seconds: 900
+
+  - name: bbc_world
+    url: http://feeds.bbci.co.uk/news/world/rss.xml
+    region: global
+    weight: 0.8
+    fetch_interval_seconds: 900
+
+  - name: aljazeera
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    region: global
+    weight: 0.6
+    fetch_interval_seconds: 1200
+
+  # 美国政策/经济
+  - name: fed_press
+    url: https://www.federalreserve.gov/feeds/press_all.xml
+    region: us
+    weight: 1.5    # 高权重 - 央行公告
+    fetch_interval_seconds: 600
+
+  - name: fed_monetary
+    url: https://www.federalreserve.gov/feeds/press_monetary.xml
+    region: us
+    weight: 1.5
+    fetch_interval_seconds: 600
+
+  - name: us_treasury
+    url: https://home.treasury.gov/news/rss/press-releases.xml
+    region: us
+    weight: 1.0
+    fetch_interval_seconds: 1200
+
+  - name: zerohedge
+    url: https://feeds.feedburner.com/zerohedge/feed
+    region: us
+    weight: 0.5    # 立场偏激, 但快, 当先行指标
+    fetch_interval_seconds: 600
+
+  # 中国政策/财经
+  - name: xinhua_politics
+    url: http://www.xinhuanet.com/politics/news_politics.xml
+    region: cn
+    weight: 1.5    # 央媒 = 政策风向
+    fetch_interval_seconds: 600
+
+  - name: gov_cn
+    url: http://sousuo.www.gov.cn/sousuo/rss.xml?policy=true
+    region: cn
+    weight: 1.5
+    fetch_interval_seconds: 1200
+
+  - name: caixin
+    url: https://www.caixin.com/rss/blog.xml
+    region: cn
+    weight: 0.8
+    fetch_interval_seconds: 1200
+
+  # ===== AI 数据中心 / GPU 集群 行业领先信号 =====
+  # 大客户公告 GPU 数量比官方财报披露 capex 早 3-6 个月 — 直接驱动 NVDA/AMD/SOXX/VRT/GRID
+  - name: dcd_news
+    url: https://www.datacenterdynamics.com/en/rss/
+    region: global
+    weight: 1.3
+    fetch_interval_seconds: 1800
+    notes: "Data Center Dynamics — 数据中心新建 / GPU 集群规模公告"
+
+  - name: tomshardware_news
+    url: https://www.tomshardware.com/feeds/all
+    region: global
+    weight: 1.0
+    fetch_interval_seconds: 1800
+    notes: "Tom's Hardware — GPU 评测 / 供应链 / 价格趋势"
+
+  - name: nextplatform
+    url: https://www.nextplatform.com/feed/
+    region: global
+    weight: 1.2
+    fetch_interval_seconds: 1800
+    notes: "The Next Platform — 企业级 AI 集群部署深度报道"
+
+  - name: register_ai
+    url: https://www.theregister.com/data_centre/headlines.atom
+    region: global
+    weight: 1.0
+    fetch_interval_seconds: 1800
+    notes: "The Register Data Centre — hyperscaler/AI infra 新闻"
+
+  - name: semiconductor_engineering
+    url: https://semiengineering.com/feed/
+    region: global
+    weight: 1.0
+    fetch_interval_seconds: 3600
+    notes: "Semiconductor Engineering — 封装 / CoWoS / HBM 产能新闻"
+
+# ===== 音频源 (audio_discovery) =====
+audio_sources:
+  # 美联储 FOMC 记者会
+  - name: fed_fomc
+    type: html_scraper
+    url: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    selector: a[href*=".mp4"], a[href*="webcast"]
+    region: us
+    priority: 9          # FOMC = 顶级重要
+    poll_interval_seconds: 21600   # 每 6h 一次
+
+  # 美股持仓股 IR 页面 (季报后通常发 earnings call audio)
+  - name: vrt_ir
+    type: html_scraper
+    url: https://investors.vertiv.com/news-events/events
+    selector: a[href*="webcast"], a[href*=".mp3"]
+    holding: VRT
+    priority: 7
+    poll_interval_seconds: 86400   # 每天一次
+
+  - name: rklb_ir
+    type: html_scraper
+    url: https://investors.rocketlabusa.com/financial-information/quarterly-results
+    selector: a[href*="webcast"], a[href*=".mp3"]
+    holding: RKLB
+    priority: 7
+    poll_interval_seconds: 86400
+
+  # A 股巨潮路演 (业绩说明会)
+  - name: juchao_wmsj
+    type: api
+    url: http://rs.szse.cn/api/rs/internalCommon/internalCommonHandler/getRoadShowList
+    params:
+      stockCode: "002624"
+    holding: 002624.SZ
+    priority: 8
+    poll_interval_seconds: 21600
+
+  # 财经播客 RSS
+  - name: wsj_markets
+    type: podcast_rss
+    url: https://video-api.wsj.com/podcast/rss/wsj/whats-news
+    region: us
+    priority: 5
+    poll_interval_seconds: 14400
+
+  - name: bloomberg_daybreak_asia
+    type: podcast_rss
+    url: https://feeds.bloomberg.fm/BLM2614333478
+    region: global
+    priority: 5
+    poll_interval_seconds: 14400
+
+# ===== Watchlist symbols 自动监控 (Phase 1+ 用) =====
+fundamentals_targets:
+  # 持仓股 (从 portfolio.yaml 读, 这里只补充非持仓的关注)
+  - SPY        # 大盘对照
+  - SMH        # 半导体 ETF 对照 (SOXX 替补)
+  - 600519.SS  # 茅台 (A 股大盘代理)
+
+# ===== 关键词过滤 (newswatch 早期粗筛) =====
+keywords_priority:
+  high:
+    - 美联储
+    - Fed
+    - Powell
+    - rate cut
+    - rate hike
+    - 加息
+    - 降息
+    - 战争
+    - sanction
+    - 制裁
+    - earnings
+    - 业绩
+    - 财报
+    - 黑天鹅
+  medium:
+    - 半导体
+    - semiconductor
+    - AI
+    - chip
+    - tariff
+    - 关税
+    - 政策
+    - 中美
+    # AI infra 大客户 capex / GPU 集群 / 供应链瓶颈关键词
+    - hyperscaler
+    - data center
+    - data centre
+    - GPU cluster
+    - H100
+    - H200
+    - B100
+    - B200
+    - GB200
+    - MI300
+    - MI325
+    - MI350
+    - CoWoS
+    - HBM3
+    - HBM4
+    - liquid cooling
+    - 液冷
+    - capex
+    - 资本开支
+    - 算力
+    - Stargate
+    - Hyperion
+    - Colossus
+    - Lambda Labs
+    - CoreWeave
+    - 数据中心
+  ignore:
+    - 体育
+    - sports
+    - 娱乐
+    - 八卦

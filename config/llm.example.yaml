@@ -1,0 +1,17 @@
+# LLM endpoint config for llm_packager (daily report formatting).
+# COPY THIS to llm.yaml and fill in api_key (or use env var).
+# llm.yaml is gitignored.
+#
+# For the multi-backend llm_router (newswatch/investigator/etc), see llm_routes.yaml
+# which already uses env var indirection (api_key_env: DASHSCOPE_KEY).
+
+endpoint:
+  # Dashscope-compatible OpenAI endpoint (works via local nginx proxy or direct):
+  #   direct:  https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   nginx:   http://localhost/dashscope/v1
+  base_url: "http://localhost/dashscope/v1"
+  api_key: "REPLACE_WITH_YOUR_DASHSCOPE_KEY"
+  model: "qwen3.5-plus"
+  timeout: 300
+  max_tokens: 4096
+  temperature: 0.2          # 低温度: 严格格式化, 不让 LLM 发挥

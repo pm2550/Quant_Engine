@@ -1,0 +1,55 @@
+# LLM 路由配置 — 改这里就能换模型/换厂商, 不用碰代码.
+#
+# 加新厂商:
+#   - 如果是 OpenAI 兼容 (/v1/chat/completions), type=openai_compat 直接加 providers 一节即可
+#     例: openrouter: {type: openai_compat, base_url_env: OPENROUTER_BASE, api_key_env: OPENROUTER_KEY}
+#   - 如果是新形状 API, llm_router.py 加一个 Provider 子类
+#
+# 改路由优先级: 编辑 routes 列表顺序. 链表第一个失败自动 fallback 到下一个.
+#
+# ⚠️ deepseek 系列已下架 (主人反馈幻觉严重 — 见 memory/feedback_no_deepseek.md)
+
+providers:
+  dashscope:
+    type: openai_compat
+    base_url_env: DASHSCOPE_BASE      # 默认 http://localhost/dashscope/v1
+    api_key_env: DASHSCOPE_CODING_KEY
+    fallback_api_key_env: DASHSCOPE_API_KEY
+    default_timeout: 120
+  ollama:
+    type: ollama
+    base_url_env: OLLAMA_CLOUD_BASE   # 默认 https://ollama.com
+    api_key_env: OLLAMA_CLOUD_KEY
+    default_timeout: 240
+  gemini:
+    type: gemini_embed
+    api_key_env: GEMINI_API_KEY
+    default_timeout: 60
+
+# task → provider:model chain. 第一个成功即返回, 失败链式 fallback.
+routes:
+  simple_chat:    [dashscope:qwen3.6-plus]
+  format:         [dashscope:qwen3.6-plus]
+  reasoning:      [ollama:glm-5.1, ollama:kimi-k2.6, dashscope:qwen3.6-plus]
+  deep_reasoning: [ollama:kimi-k2-thinking, ollama:glm-5.1, ollama:kimi-k2.6, dashscope:qwen3.6-plus]
+  fast_reasoning: [ollama:glm-5.1, dashscope:qwen3.6-plus]
+  long_context:   [ollama:kimi-k2.6, ollama:glm-5.1, dashscope:qwen3.6-plus]   # k2.6 = 256k ctx
+  code:           [ollama:qwen3-coder-next, ollama:glm-5.1]
+  agentic:        [ollama:kimi-k2.6, ollama:glm-5.1]
+  review:         [ollama:kimi-k2-thinking, ollama:glm-5.1]
+  vision:         [dashscope:qwen3.6-plus, ollama:qwen3-vl:235b]
+
+# 每百万 token (input, output) USD. 0 = 订阅制/免费.
+# 厂商改价或换计费模式时, 改这里, llm_audit 表里 cost_usd 自动跟着变.
+costs:
+  "dashscope:qwen3.6-plus":     [0.0, 0.0]
+  "ollama:glm-5.1":             [0.0, 0.0]
+  "ollama:kimi-k2.6":           [0.0, 0.0]
+  "ollama:kimi-k2-thinking":    [0.0, 0.0]
+  "ollama:qwen3-coder-next":    [0.0, 0.0]
+  "ollama:qwen3-vl:235b":       [0.0, 0.0]
+  "gemini:gemini-embedding-001": [0.0, 0.0]
+
+embeddings:
+  default: gemini:gemini-embedding-001
+  dim: 3072
