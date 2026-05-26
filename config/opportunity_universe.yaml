@@ -5,7 +5,7 @@
 # 维护原则: 控制在 ~25 只以内 (避免噪音 + 数据维护成本). 优先主人感兴趣的赛道.
 
 universe:
-  # AI / 半导体 (跟现有持仓 SOXX/AMD/NVDA 同主题, 寻找未持仓的赛道补充)
+  # AI / 半导体 (主流 AI 算力赛道, 寻找未持仓的互补标的)
   - symbol: META
     theme: ai_software
     reason: 大型 AI infra 客户 + LLAMA 模型

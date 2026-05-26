@@ -258,7 +258,7 @@ def _push_finding(event_id: int, summary: str, finding: dict, chat_id: str,
 
 def run_once(*, limit: int = 5, dry_run: bool = False, push_threshold: int = 7) -> dict:
     portfolio = cfg_mod.load("portfolio")
-    chat_id = str(portfolio.get("telegram_target", "6213084357"))
+    chat_id = str(portfolio.get("telegram_target", ""))
     pending = _claim_pending(limit=limit)
     out_findings = []
     for ev in pending:

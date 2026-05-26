@@ -1,8 +1,8 @@
 """A 股个股新闻抓取 (东方财富 via akshare).
 
-为什么 (2026-05-08 incident): 原 newswatch RSS 24 个全是国际/美国宏观,
-A 股个股 0 覆盖. 主人 67% 仓位 002624 完美世界涨停 8h 系统静默 + events
-表里全是"霍尔木兹冲突 affected_symbols=[002624.SZ]"这种荒谬关联.
+为什么: 原 newswatch RSS 24 个全是国际/美国宏观, A 股个股 0 覆盖. 持仓里
+的 A 股标的出现涨停级行情时系统会长时间静默, 且 events 表里 LLM 会把
+宏观新闻错误关联到不相关的 A 股代码.
 
 设计:
   - 对持仓 + watchlist 中的所有 A 股 (.SZ/.SS/.BJ), 每 30min 调

@@ -225,7 +225,7 @@ def _mark_pushed(event_id: int) -> None:
 def run_once(*, push_threshold: int = 6, dry_run: bool = False) -> dict:
     portfolio = cfg_mod.load("portfolio")
     strategies = cfg_mod.load("strategies")
-    chat_id = str(portfolio.get("telegram_target", "6213084357"))
+    chat_id = str(portfolio.get("telegram_target", ""))
     held = list(portfolio.get("positions", {}).keys())
     watch = [w["symbol"] for w in portfolio.get("watchlist", [])]
     symbols = list(dict.fromkeys(held + watch))   # dedup, preserve order

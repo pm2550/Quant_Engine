@@ -1,9 +1,8 @@
 """组合视角告警 — 不是单股 spam, 看主题板块层异动.
 
-为什么 (2026-05-08 incident): 主人 5/7 22:09 "今天怎么又狂跌了" 是因为
-ARM -10 / VRT -5 / AVGO -3 / DRAM -4 / SOXX -3 单日齐跌. intraday alerter
-推过单股告警, 但**没人告诉主人 "今天你 49% AI 仓位 -2.5%"**. portfolio_pulse
-专门补这条.
+为什么: 单股 intraday alerter 在板块齐跌时会喷大量孤立告警, 用户看到的是
+"为什么今天又跌了" 而不是 "今天 AI 主题 -X%". portfolio_pulse 补这条
+组合层视角.
 
 设计:
   - US close (21:30 UTC, Mon-Fri) 跑一次
@@ -219,7 +218,7 @@ def run_market(market: str, *, dry_run: bool = False) -> dict:
 
     if pulse.get("should_push"):
         portfolio = cfg_mod.load("portfolio")
-        chat_id = str(portfolio.get("telegram_target", "6213084357"))
+        chat_id = str(portfolio.get("telegram_target", ""))
         if _push_tg(pulse, chat_id):
             with db.conn() as c:
                 c.execute(
