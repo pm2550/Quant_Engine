@@ -141,12 +141,12 @@ def walk_forward_train(big: pd.DataFrame, *, n_folds: int = 4,
         "objective": "regression",
         "metric": "rmse",
         "learning_rate": 0.05,
-        "num_leaves": 210,
-        "max_depth": 8,
-        "colsample_bytree": 0.88,
-        "subsample": 0.88,
-        "lambda_l1": 200.0,
-        "lambda_l2": 580.0,
+        "num_leaves": 64,
+        "max_depth": 7,
+        "colsample_bytree": 0.85,
+        "subsample": 0.85,
+        "lambda_l1": 20.0,
+        "lambda_l2": 50.0,
         "verbose": -1,
         "num_threads": 4,  # don't hog the box
     }
@@ -232,6 +232,66 @@ def walk_forward_train(big: pd.DataFrame, *, n_folds: int = 4,
     return summary
 
 
+def train_full(big: pd.DataFrame, *, save_path: str | Path,
+               num_boost_round: int = 400) -> dict:
+    """Train one LGBM on ALL available data, save the booster + feature schema.
+
+    Use this for the daily-serve model (not for evaluation — evaluation goes
+    through `walk_forward_train` which is honest about OOS behavior).
+    """
+    import lightgbm as lgb
+
+    feat_cols = [c for c in big.columns if c != "label"]
+    big = big.sort_index().dropna(subset=["label"])
+
+    dates = big.index.get_level_values("date").unique().sort_values()
+    if len(dates) < 100:
+        raise ValueError(f"need >= 100 dates, have {len(dates)}")
+    val_cutoff = dates[-60]
+    train_mask = big.index.get_level_values("date") < val_cutoff - pd.Timedelta(days=HORIZON_DAYS + 2)
+    val_mask = big.index.get_level_values("date") >= val_cutoff
+    train = big[train_mask]
+    val = big[val_mask]
+
+    params = {
+        "objective": "regression",
+        "metric": "rmse",
+        "learning_rate": 0.05,
+        "num_leaves": 64,
+        "max_depth": 7,
+        "colsample_bytree": 0.85,
+        "subsample": 0.85,
+        "lambda_l1": 20.0,
+        "lambda_l2": 50.0,
+        "verbose": -1,
+        "num_threads": 4,
+    }
+    dtrain = lgb.Dataset(train[feat_cols].values, label=train["label"].values)
+    dval = lgb.Dataset(val[feat_cols].values, label=val["label"].values, reference=dtrain)
+    booster = lgb.train(params, dtrain, num_boost_round=num_boost_round,
+                        valid_sets=[dval],
+                        callbacks=[lgb.early_stopping(30, verbose=False),
+                                   lgb.log_evaluation(0)])
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(save_path))
+    schema_path = save_path.with_suffix(".features.json")
+    with open(schema_path, "w") as f:
+        json.dump({"features": feat_cols, "horizon_days": HORIZON_DAYS,
+                   "best_iteration": int(booster.best_iteration or 0),
+                   "trained_at": datetime.utcnow().isoformat() + "Z",
+                   "train_rows": len(train), "val_rows": len(val)}, f, indent=2)
+    return {
+        "model_path": str(save_path),
+        "schema_path": str(schema_path),
+        "best_iteration": int(booster.best_iteration or 0),
+        "train_rows": len(train),
+        "val_rows": len(val),
+        "n_features": len(feat_cols),
+    }
+
+
 def _discover_symbols() -> list[str]:
     """Union of currently cached parquet files."""
     return sorted(p.stem for p in Path("/data2/quant/data/prices").glob("*.parquet"))
@@ -243,6 +303,10 @@ def main():
     ap.add_argument("--folds", type=int, default=4)
     ap.add_argument("--val-years", type=float, default=1.0)
     ap.add_argument("--out", default="/data2/quant/results/challenger_baseline.json")
+    ap.add_argument("--train-full", action="store_true",
+                    help="train one model on ALL data and save (for daily serve)")
+    ap.add_argument("--model-path", default="/data2/quant/models/challenger_lgbm.txt",
+                    help="output booster path when --train-full is set")
     args = ap.parse_args()
 
     syms = args.syms.split(",") if args.syms else _discover_symbols()
@@ -255,6 +319,12 @@ def main():
     if big.empty:
         print("empty dataset", file=sys.stderr)
         return 1
+
+    if args.train_full:
+        print(f"train-full: saving booster to {args.model_path}")
+        info = train_full(big, save_path=args.model_path)
+        print(json.dumps(info, indent=2))
+        return 0
 
     print(f"training walk-forward (n_folds={args.folds}, val_years={args.val_years})...")
     summary = walk_forward_train(big, n_folds=args.folds, val_years=args.val_years)

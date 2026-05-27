@@ -38,6 +38,30 @@ def run(*, dry_run: bool = False, full_refresh: bool = False) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("alt-data render failed (skipping): %s", e)
 
+    # Append LightGBM challenger section (Phase 2 of validate-the-engine plan).
+    # Runs the challenger in a separate qlib_env subprocess so prod venv doesn't
+    # need lightgbm. Falls back to cached predictions if subprocess fails.
+    try:
+        from .ml import serve as challenger_serve
+        portfolio_pos = (raw or {}).get("portfolio", {}).get("weights", {}) or {}
+        held_syms = list(portfolio_pos.keys())
+        rec_actions = {r.get("symbol"): r.get("action") for r in (raw or {}).get("recommendations", [])
+                       if r.get("symbol")}
+        preds, freshness = challenger_serve.get_predictions(refresh=True)
+        if preds:
+            ch_section = challenger_serve.render_section(
+                preds, composite_actions=rec_actions,
+                held_symbols=held_syms, freshness=freshness,
+            )
+            if ch_section:
+                text = text + "\n\n" + ch_section
+                log.info("appended challenger section (%d chars, freshness=%s)",
+                         len(ch_section), freshness)
+        else:
+            log.info("challenger predictions unavailable; skipping section")
+    except Exception as e:  # noqa: BLE001
+        log.warning("challenger render failed (skipping): %s", e)
+
     # Save the rendered report
     rpt_dir = cfg_mod.ROOT / "reports"
     rpt_dir.mkdir(parents=True, exist_ok=True)

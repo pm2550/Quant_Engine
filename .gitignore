@@ -56,3 +56,6 @@ workers/
 qlib_env/
 qlib_src/
 results/challenger_*.json
+
+# Trained models (binary, retrained weekly)
+models/
