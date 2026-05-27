@@ -51,3 +51,8 @@ workers/
 *.swo
 .DS_Store
 .env.local
+
+# ML challenger sandbox (separate aarch64-friendly venv + qlib source clone + model output)
+qlib_env/
+qlib_src/
+results/challenger_*.json
