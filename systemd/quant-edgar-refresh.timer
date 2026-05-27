@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly SEC EDGAR companyfacts refresh (1st of month, 04:30 UTC, before challenger retrain)
+
+[Timer]
+OnCalendar=*-*-01 04:30:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

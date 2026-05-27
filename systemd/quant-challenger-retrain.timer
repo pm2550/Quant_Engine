@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly challenger retrain (Sunday 05:00 UTC, after EDGAR refresh)
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

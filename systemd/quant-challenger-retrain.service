@@ -1,0 +1,13 @@
+[Unit]
+Description=Retrain LightGBM challenger weekly on latest 20y dataset + EDGAR fundamentals
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+ExecStart=/data2/quant/qlib_env/bin/python -m quant.ml.challenger --train-full --model-path /data2/quant/models/challenger_lgbm.txt
+StandardOutput=append:/data2/quant/logs/challenger_retrain.log
+StandardError=append:/data2/quant/logs/challenger_retrain.err
+TimeoutStartSec=1800

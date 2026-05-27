@@ -45,10 +45,22 @@ def _load_all(symbols: list[str]) -> dict[str, pd.DataFrame]:
     return out
 
 
+# Cross-sectional rank features — DISABLED by default after empirical
+# ablation on 2026-05-27:
+#   v4 (no XS rank)        IC +0.049 / RankIC +0.040
+#   v5 (14 XS ranks)       IC +0.037 / RankIC +0.018  ← overfit on small universe
+#   v5b (4 XS ranks)       IC +0.041 / RankIC +0.039  ← still worse than v4
+# Cause: XS rank tricks need ≥ 300 symbols/day to add signal. Our 95-symbol
+# universe is too small; ranks collapse into noisy buckets. Keep the code
+# for future universe-expansion (turn flag on when we add SP500 watchlist).
+XS_RANK_BASE_FEATURES = ["MA20", "STD20", "ROC60", "RSV20"]
+
+
 def _build_dataset(price_dfs: dict[str, pd.DataFrame],
                     *, horizon_days: int = HORIZON_DAYS,
                     include_macro: bool = True,
-                    include_fundamentals: bool = True) -> pd.DataFrame:
+                    include_fundamentals: bool = True,
+                    include_xs_rank: bool = False) -> pd.DataFrame:
     """Returns a long-form df with (date, symbol) index + feature cols + label.
 
     Macro features (VIX, yields, DXY, commodities) are broadcast: same value
@@ -95,6 +107,16 @@ def _build_dataset(price_dfs: dict[str, pd.DataFrame],
             macro_reset["date"] = pd.to_datetime(macro_reset["date"]).dt.tz_localize(None)
             merged = pd.merge_asof(tmp, macro_reset, on="date", direction="backward")
             big = merged.set_index(["date", "symbol"]).sort_index()
+
+    if include_xs_rank:
+        # For each (date), rank each XS_RANK_BASE_FEATURES across symbols, output
+        # as XS_<col> percentile [0, 1]. Captures "rich vs cheap / hot vs cold
+        # vs today's universe". Cross-sectional, broadcast-free, full-history.
+        present_bases = [c for c in XS_RANK_BASE_FEATURES if c in big.columns]
+        if present_bases:
+            ranked = big[present_bases].groupby(level="date").rank(pct=True)
+            ranked.columns = ["XS_" + c for c in ranked.columns]
+            big = big.join(ranked)
 
     # Drop rows where most features are NaN (early warm-up)
     feat_cols = [c for c in big.columns if c != "label"]

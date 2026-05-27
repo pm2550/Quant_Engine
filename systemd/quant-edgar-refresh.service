@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh SEC EDGAR companyfacts JSON cache for all tracked symbols
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+ExecStart=/data2/quant/qlib_env/bin/python -m quant.ml.edgar
+StandardOutput=append:/data2/quant/logs/edgar_refresh.log
+StandardError=append:/data2/quant/logs/edgar_refresh.err
+TimeoutStartSec=600
