@@ -98,8 +98,9 @@ def render_section(preds: dict, *,
     held_set = set(held_symbols or [])
 
     lines = [
-        "📊 *LightGBM Challenger* (Alpha158 + macro, OOS IC ≈ 0.06)",
+        "📊 *LightGBM Challenger* (Alpha158+macro+EDGAR, 161 特征)",
         f"as_of: {as_of}, 预测 {horizon}d 收益; freshness: {freshness}",
+        "OOS: IC +0.049 / RankIC +0.040 / TopDecile Spread +3.5%/20d",
     ]
 
     def _disagree_marker(sym: str, pred: float) -> str:

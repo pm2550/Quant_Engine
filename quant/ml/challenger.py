@@ -18,6 +18,7 @@ import pandas as pd
 
 from quant.ml import features as ml_features
 from quant.ml import macro as ml_macro
+from quant.ml import edgar as ml_edgar
 
 PRICES_DIR = Path("/data2/quant/data/prices")
 
@@ -46,18 +47,31 @@ def _load_all(symbols: list[str]) -> dict[str, pd.DataFrame]:
 
 def _build_dataset(price_dfs: dict[str, pd.DataFrame],
                     *, horizon_days: int = HORIZON_DAYS,
-                    include_macro: bool = True) -> pd.DataFrame:
+                    include_macro: bool = True,
+                    include_fundamentals: bool = True) -> pd.DataFrame:
     """Returns a long-form df with (date, symbol) index + feature cols + label.
 
     Macro features (VIX, yields, DXY, commodities) are broadcast: same value
     for every symbol on a given date. Joins via merge_asof to handle CN
     trading-day misalignment (A-share trades when US is closed and vice versa).
+
+    Fundamentals (SEC EDGAR XBRL) are PIT-aligned per symbol via edgar module.
+    ETFs and foreign filers without CIK get NaN — LightGBM handles missing.
     """
     rows = []
     for sym, df in price_dfs.items():
         feats = ml_features.build_features(df)
         if feats.empty:
             continue
+        if include_fundamentals:
+            try:
+                fund = ml_edgar.fundamental_features_for(sym, feats.index)
+                if not fund.empty:
+                    # Prefix to avoid name collisions with technical features
+                    fund = fund.add_prefix("FUND_")
+                    feats = feats.join(fund)
+            except Exception:  # noqa: BLE001
+                pass  # silently skip; LGBM handles NaN
         feats["symbol"] = sym
         feats["label"] = ml_features.forward_return_label(df, horizon_days=horizon_days)
         rows.append(feats)

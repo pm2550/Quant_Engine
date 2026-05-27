@@ -139,7 +139,7 @@ def render_tg_section(preds: dict[str, dict], *,
     horizon = next(iter(preds.values()))["horizon_days"]
     as_of = next(iter(preds.values()))["as_of"]
 
-    lines = [f"📊 *LightGBM Challenger* (Alpha158 + macro, 144+7 特征, OOS IC ≈ 0.058)",
+    lines = [f"📊 *LightGBM Challenger* (Alpha158+macro+EDGAR, 161 特征, OOS RankIC≈0.04, Spread +3.5%/20d)",
              f"as_of: {as_of}, 预测 {horizon}d 收益率"]
 
     lines.append("\n*Top 看多:*")
