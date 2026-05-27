@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from quant.ml import features as ml_features
+from quant.ml import macro as ml_macro
 
 PRICES_DIR = Path("/data2/quant/data/prices")
 
@@ -44,8 +45,14 @@ def _load_all(symbols: list[str]) -> dict[str, pd.DataFrame]:
 
 
 def _build_dataset(price_dfs: dict[str, pd.DataFrame],
-                    *, horizon_days: int = HORIZON_DAYS) -> pd.DataFrame:
-    """Returns a long-form df with (date, symbol) index + feature cols + label."""
+                    *, horizon_days: int = HORIZON_DAYS,
+                    include_macro: bool = True) -> pd.DataFrame:
+    """Returns a long-form df with (date, symbol) index + feature cols + label.
+
+    Macro features (VIX, yields, DXY, commodities) are broadcast: same value
+    for every symbol on a given date. Joins via merge_asof to handle CN
+    trading-day misalignment (A-share trades when US is closed and vice versa).
+    """
     rows = []
     for sym, df in price_dfs.items():
         feats = ml_features.build_features(df)
@@ -60,6 +67,21 @@ def _build_dataset(price_dfs: dict[str, pd.DataFrame],
     big.index.name = "date"
     big = big.set_index("symbol", append=True).reorder_levels(["date", "symbol"]).sort_index()
     big = big.dropna(subset=["label"])
+
+    if include_macro:
+        macro_df = ml_macro.load_macro_features()
+        if not macro_df.empty:
+            macro_df = macro_df.sort_index()
+            macro_df.index = macro_df.index.tz_localize(None) if macro_df.index.tz else macro_df.index
+            macro_df.index.name = "date"
+            macro_reset = macro_df.reset_index()
+            # merge_asof handles CN/US trading-day mismatch (forward-fill last known macro)
+            tmp = big.reset_index().sort_values("date")
+            tmp["date"] = pd.to_datetime(tmp["date"]).dt.tz_localize(None)
+            macro_reset["date"] = pd.to_datetime(macro_reset["date"]).dt.tz_localize(None)
+            merged = pd.merge_asof(tmp, macro_reset, on="date", direction="backward")
+            big = merged.set_index(["date", "symbol"]).sort_index()
+
     # Drop rows where most features are NaN (early warm-up)
     feat_cols = [c for c in big.columns if c != "label"]
     big = big.dropna(thresh=int(0.6 * len(feat_cols)), subset=feat_cols)
