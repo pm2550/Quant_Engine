@@ -28,6 +28,18 @@ def run(*, dry_run: bool = False, full_refresh: bool = False) -> None:
     text = llm_packager.package(raw)
     log.info("LLM produced %d chars", len(text))
 
+    # Consolidated 24h events digest (replaces per-event TG spam — newswatch /
+    # anomaly_watcher / investigator push thresholds were bumped to 9 on
+    # 2026-06-01 after the LLM-direction-hit-rate audit returned ≈50% noise).
+    try:
+        from . import events_digest
+        ev_section = events_digest.render_section()
+        if ev_section:
+            text = text + "\n\n" + ev_section
+            log.info("appended events_digest section (%d chars)", len(ev_section))
+    except Exception as e:  # noqa: BLE001
+        log.warning("events_digest render failed (skipping): %s", e)
+
     # Append alt-data leading-indicator section (static format, no LLM repack)
     try:
         from .alt_data import formatter as alt_fmt

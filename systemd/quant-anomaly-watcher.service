@@ -1,0 +1,21 @@
+[Unit]
+Description=Quant anomaly watcher (price/volume/RSI/MA200 → events.category=price_action)
+After=network-online.target quant-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+EnvironmentFile=/data2/quant/secrets/secrets.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/data2/quant/venv/bin/python -m quant.anomaly_watcher --interval 300 --push-threshold 9
+Restart=always
+RestartSec=30
+Nice=10
+StandardOutput=append:/data2/quant/logs/anomaly_watcher.log
+StandardError=append:/data2/quant/logs/anomaly_watcher.err
+
+[Install]
+WantedBy=multi-user.target

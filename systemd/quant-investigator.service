@@ -1,0 +1,20 @@
+[Unit]
+Description=Quant investigator daemon (events.price_action → SearXNG + LLM cause)
+After=network-online.target quant-api.service quant-anomaly-watcher.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+EnvironmentFile=/data2/quant/secrets/secrets.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/data2/quant/venv/bin/python -m quant.investigator --interval 60 --limit 5 --push-threshold 9
+Restart=always
+RestartSec=30
+Nice=10
+StandardOutput=append:/data2/quant/logs/investigator.log
+StandardError=append:/data2/quant/logs/investigator.err
+
+[Install]
+WantedBy=multi-user.target
