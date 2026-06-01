@@ -1,4 +1,4 @@
-# Quant Engine
+# Quant Engine 
 
 A personal quantitative trading research / decision-support pipeline for US
 equities and Chinese A-shares.  Multi-factor signal scoring, walk-forward
