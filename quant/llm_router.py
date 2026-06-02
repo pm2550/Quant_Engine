@@ -415,7 +415,13 @@ def chat(
 
 
 def chat_json(prompt: str, *, task: str = "simple_chat", **kw) -> Any:
-    """Convenience: chat with response_format=json, parse, return dict."""
+    """Convenience: chat with response_format=json, parse, return dict.
+
+    Thinking-mode models (glm-5.1, kimi-k2.6 etc.) are forced to skip thinking
+    here — otherwise they emit `{thinking}\\n{json}` concatenated and json.loads
+    fails with `Extra data: line 1 column 2`.
+    """
+    kw.setdefault("disable_thinking", True)
     out = chat(prompt, task=task, response_format="json", **kw)
     text = out["text"].strip()
     # Strip code fences if model added them
@@ -423,11 +429,19 @@ def chat_json(prompt: str, *, task: str = "simple_chat", **kw) -> Any:
         text = text.split("```", 2)[1]
         if text.startswith("json"):
             text = text[4:]
+    # Salvage: if model emitted multiple JSON objects (thinking + content),
+    # try to extract just the first valid object.
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        log.warning("JSON parse failed: %s; raw=%s", e, text[:200])
-        raise
+        # Try parsing the first {...} block via raw_decode
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text)
+            log.warning("JSON had trailing data (%s), salvaged first object", e)
+            return obj
+        except (json.JSONDecodeError, ValueError):
+            log.warning("JSON parse failed: %s; raw=%s", e, text[:300])
+            raise
 
 
 def embed(texts: list[str] | str, *, model: str | None = None) -> list[list[float]]:
