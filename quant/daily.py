@@ -25,8 +25,41 @@ def run(*, dry_run: bool = False, full_refresh: bool = False) -> None:
         except Exception:
             log.exception("decision_log write failed (non-fatal)")
 
-    text = llm_packager.package(raw)
-    log.info("LLM produced %d chars", len(text))
+    try:
+        text = llm_packager.package(raw)
+        log.info("LLM produced %d chars", len(text))
+    except Exception as e:  # noqa: BLE001
+        log.warning("LLM packager failed (%s); falling back to structured-only digest", e)
+        # Build a minimal markdown so downstream sections (macro_regime,
+        # events_digest, challenger) still get appended.
+        recs = raw.get("recommendations", [])
+        port = raw.get("portfolio", {})
+        lines = [
+            "⚠️ *LLM 包装失败 — 显示原始决策 (检查 dashscope token)*",
+            "",
+            f"组合: {port.get('total_value_usd', 0):,.0f} USD, 今日 {port.get('chg_1d_pct', 0):+.2f}%",
+            "",
+            "*建议:*",
+        ]
+        for r in recs:
+            sym = r.get("symbol", "?")
+            act = r.get("action", "?")
+            cur_w = r.get("current_weight", 0) * 100
+            tgt_w = r.get("target_weight", 0) * 100
+            lines.append(f"  {sym} {act}: {cur_w:.1f}% → {tgt_w:.1f}%")
+        text = "\n".join(lines)
+
+    # Macro regime overlay (1 line: VIX / curve / Fed / unemployment / USDJPY → risk score).
+    # NOT a per-symbol ML feature (broadcast macro destroys cross-sectional IC, see
+    # 2026-06-01 ablation in quant.ml.macro) — it's a total-exposure recommendation.
+    try:
+        from . import macro_regime
+        mr_section = macro_regime.render_section()
+        if mr_section:
+            text = text + "\n\n" + mr_section
+            log.info("appended macro_regime section (%d chars)", len(mr_section))
+    except Exception as e:  # noqa: BLE001
+        log.warning("macro_regime render failed (skipping): %s", e)
 
     # Consolidated 24h events digest (replaces per-event TG spam — newswatch /
     # anomaly_watcher / investigator push thresholds were bumped to 9 on

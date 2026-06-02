@@ -29,6 +29,17 @@ TICKERS = {
     "DX-Y.NYB": "dxy.parquet",       # US Dollar Index
     "GC=F":     "gold.parquet",      # Gold futures
     "CL=F":     "oil.parquet",       # Crude oil futures
+    "JPY=X":    "usdjpy.parquet",    # USDJPY — yen carry / risk-off barometer
+}
+
+# FRED series id → cache filename; downloaded as CSV without auth via fredgraph URL
+FRED_SERIES = {
+    "DFF":      "fred_dff.parquet",       # Federal Funds Rate (daily, effective)
+    "UNRATE":   "fred_unrate.parquet",    # US unemployment rate (monthly)
+    "CPIAUCSL": "fred_cpi.parquet",       # CPI all items (monthly, index level)
+    "INDPRO":   "fred_indpro.parquet",    # Industrial Production index (monthly)
+    "T10Y2Y":   "fred_t10y2y.parquet",    # 10Y minus 2Y Treasury (daily, recession indicator)
+    "PAYEMS":   "fred_payems.parquet",    # Nonfarm payrolls (monthly, level in thousands)
 }
 
 LOOKBACK_YEARS = 20
@@ -37,8 +48,11 @@ LOOKBACK_YEARS = 20
 def refresh_all(force: bool = False) -> dict[str, int]:
     """Download (or incrementally update) all macro tickers; return per-ticker row counts."""
     import yfinance as yf
+    import requests
     out = {}
     start = date.today() - timedelta(days=365 * LOOKBACK_YEARS)
+
+    # 1. yfinance index tickers (VIX, yields, DXY, gold, oil, USDJPY)
     for ticker, fname in TICKERS.items():
         p = CACHE / fname
         if p.exists() and not force:
@@ -67,7 +81,37 @@ def refresh_all(force: bool = False) -> dict[str, int]:
             df = pd.concat([keep, df]).sort_index()
         df.to_parquet(p)
         out[ticker] = len(df)
+
+    # 2. FRED series via no-auth CSV endpoint
+    for sid, fname in FRED_SERIES.items():
+        p = CACHE / fname
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+        try:
+            r = requests.get(url, timeout=60, headers={"User-Agent": USER_AGENT})
+            r.raise_for_status()
+        except Exception as e:  # noqa: BLE001
+            log.warning("FRED fetch failed for %s: %s", sid, e)
+            out["FRED:" + sid] = -1
+            continue
+        from io import StringIO
+        try:
+            df = pd.read_csv(StringIO(r.text))
+        except Exception as e:  # noqa: BLE001
+            log.warning("FRED parse failed for %s: %s", sid, e)
+            out["FRED:" + sid] = -1
+            continue
+        # FRED CSV: observation_date,SERIES_ID; "." means missing
+        df["observation_date"] = pd.to_datetime(df["observation_date"])
+        df = df.set_index("observation_date").sort_index()
+        df.columns = [sid]
+        df[sid] = pd.to_numeric(df[sid], errors="coerce")
+        df = df.dropna()
+        df.to_parquet(p)
+        out["FRED:" + sid] = len(df)
     return out
+
+
+USER_AGENT = "gaohaopm@gmail.com Quant_Engine (research-only macro pull)"
 
 
 def load_macro_features() -> pd.DataFrame:
@@ -129,6 +173,21 @@ def load_macro_features() -> pd.DataFrame:
         feat["GOLD_CHG60"] = gold.pct_change(60)
     if oil is not None:
         feat["OIL_CHG60"] = oil.pct_change(60)
+    usdjpy = aligned.get("JPY=X")
+    if usdjpy is not None:
+        # USDJPY 60d pct change — proxy for yen carry / global risk-off
+        feat["USDJPY_CHG60"] = usdjpy.pct_change(60)
+
+    # NOTE: FRED series (DFF, UNRATE, CPI, INDPRO, T10Y2Y, PAYEMS) are
+    # downloaded + cached by refresh_all() but DELIBERATELY NOT added as ML
+    # features. The 2026-06-01 ablation showed that adding them dropped IC
+    # from +0.049 to +0.011 (RankIC +0.040 → -0.008, spread +3.5% → +1.0%).
+    # Same cross-sectional poison as raw VIX levels: broadcast macro values
+    # let LightGBM memorize calendar periods.
+    #
+    # FRED data is still useful — see quant.macro_regime for the risk-on/off
+    # OVERLAY (separate score that adjusts total exposure, not per-symbol
+    # rank). That's the right architecture for macro in this kind of system.
 
     return feat.replace([np.inf, -np.inf], np.nan)
 
