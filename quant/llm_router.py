@@ -133,6 +133,12 @@ class OllamaProvider(Provider):
         # equivalent to OpenAI's response_format={"type":"json_object"}.
         if kw.get("response_format") == "json":
             payload["format"] = "json"
+        # Disable thinking mode for tasks that need deterministic structured
+        # output (e.g. format/markdown rendering). Thinking-mode models
+        # otherwise burn the entire num_predict budget on internal reasoning
+        # and return empty content.
+        if kw.get("disable_thinking"):
+            payload["think"] = False
         r = requests.post(
             f"{self.base_url}/api/chat",
             headers={"Authorization": f"Bearer {self.api_key}",
@@ -330,6 +336,7 @@ def chat(
     temperature: float = 0.3,
     timeout: int = 120,
     response_format: str | None = None,
+    disable_thinking: bool = False,
 ) -> dict:
     """LLM dispatch via config-driven route chain. Returns dict with text/backend/tokens."""
     if isinstance(prompt, str):
@@ -364,6 +371,8 @@ def chat(
         kwargs = {"max_tokens": max_tokens, "temperature": temperature, "timeout": timeout}
         if response_format == "json":
             kwargs["response_format"] = "json"
+        if disable_thinking:
+            kwargs["disable_thinking"] = True
         t0 = time.time()
         try:
             out = provider.chat(model, messages, **kwargs)

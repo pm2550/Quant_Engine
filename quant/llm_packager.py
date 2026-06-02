@@ -1,12 +1,16 @@
-"""Send raw signals + recommendations to LLM, get back compact action list."""
+"""Send raw signals + recommendations to LLM, get back compact action list.
+
+Routed through quant.llm_router so it picks up the same provider/model chain
+as newswatch / investigator (see config/llm_routes.yaml). The legacy
+config/llm.yaml endpoint is kept only as a manual override for ad-hoc tests.
+"""
 from __future__ import annotations
 import json
 import logging
 from typing import Any
 
-from openai import OpenAI
-
 from . import config as cfg_mod
+from . import llm_router
 
 log = logging.getLogger(__name__)
 
@@ -121,24 +125,29 @@ _说明: 多因子综合中性 ≠ 不动, 而是缺乏明确 entry/exit 触发�
 
 
 def package(raw_output: dict, *, llm_cfg: dict | None = None) -> str:
-    cfg = llm_cfg or cfg_mod.load("llm")["endpoint"]
-    client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"], timeout=cfg.get("timeout", 120))
-
     # Compact the input to save tokens — drop verbose fields LLM doesn't need
     compact = _compact(raw_output)
 
-    resp = client.chat.completions.create(
-        model=cfg["model"],
-        messages=[
+    # Route via llm_router (task="format" → glm-5.1 first then kimi-k2.6,
+    # per config/llm_routes.yaml). Falls through the whole chain if any
+    # provider 401/timeouts.
+    result = llm_router.chat(
+        prompt=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(compact, ensure_ascii=False)},
         ],
-        temperature=cfg.get("temperature", 0.2),
-        max_tokens=cfg.get("max_tokens", 4096),
+        task="format",
+        max_tokens=4096,
+        temperature=0.2,
+        timeout=300,
+        disable_thinking=True,  # output is plain markdown; don't burn budget on thinking field
     )
-    text = resp.choices[0].message.content or ""
-    log.info("LLM tokens=%s/%s", resp.usage.prompt_tokens if resp.usage else "?", resp.usage.completion_tokens if resp.usage else "?")
-    return text.strip()
+    text = (result.get("text") or "").strip()
+    backend = result.get("backend") or "?"
+    tokens = result.get("tokens") or {}
+    log.info("LLM packager via %s, tokens=%s/%s",
+              backend, tokens.get("prompt", "?"), tokens.get("completion", "?"))
+    return text
 
 
 def _compact(raw: dict) -> dict:
