@@ -124,8 +124,11 @@ def run(*, dry_run: bool = False, full_refresh: bool = False) -> None:
 
     portfolio = cfg_mod.load("portfolio")
     chat_id = portfolio["telegram_target"]
-    res = telegram.send(text, chat_id=chat_id)
-    log.info("telegram ok: message_id=%s", res.get("result", {}).get("message_id"))
+    try:
+        res = telegram.send(text, chat_id=chat_id)
+        log.info("telegram ok: message_id=%s", res.get("result", {}).get("message_id"))
+    except Exception as e:  # noqa: BLE001 — report already saved; a send failure must not fail the unit
+        log.error("telegram send failed (report saved at %s, not pushed): %s", rpt_path, e)
 
 
 if __name__ == "__main__":
