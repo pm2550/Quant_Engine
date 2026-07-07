@@ -28,16 +28,18 @@ providers:
 
 # task → provider:model chain. 第一个成功即返回, 失败链式 fallback.
 routes:
-  simple_chat:    [dashscope:qwen3.6-plus]
-  format:         [dashscope:qwen3.6-plus]
-  reasoning:      [ollama:glm-5.1, ollama:kimi-k2.6, dashscope:qwen3.6-plus]
-  deep_reasoning: [ollama:kimi-k2-thinking, ollama:glm-5.1, ollama:kimi-k2.6, dashscope:qwen3.6-plus]
-  fast_reasoning: [ollama:glm-5.1, dashscope:qwen3.6-plus]
-  long_context:   [ollama:kimi-k2.6, ollama:glm-5.1, dashscope:qwen3.6-plus]   # k2.6 = 256k ctx
+  # ⚠️ dashscope (qwen coding plan, coding.dashscope.aliyuncs.com) 于 2026-06-01 过期下线.
+  #    全部改走 ollama cloud. 主模型 = kimi-k2.6 (256k, 带视觉); format 用 glm-5.1 打头 (轻/出 JSON 稳).
+  simple_chat:    [ollama:kimi-k2.6, ollama:glm-5.1]
+  format:         [ollama:glm-5.1, ollama:kimi-k2.6]
+  reasoning:      [ollama:glm-5.1, ollama:kimi-k2.6]
+  deep_reasoning: [ollama:kimi-k2-thinking, ollama:glm-5.1, ollama:kimi-k2.6]
+  fast_reasoning: [ollama:glm-5.1, ollama:kimi-k2.6]
+  long_context:   [ollama:kimi-k2.6, ollama:glm-5.1]   # k2.6 = 256k ctx
   code:           [ollama:qwen3-coder-next, ollama:glm-5.1]
   agentic:        [ollama:kimi-k2.6, ollama:glm-5.1]
   review:         [ollama:kimi-k2-thinking, ollama:glm-5.1]
-  vision:         [dashscope:qwen3.6-plus, ollama:qwen3-vl:235b]
+  vision:         [ollama:kimi-k2.6, ollama:qwen3-vl:235b]
 
 # 每百万 token (input, output) USD. 0 = 订阅制/免费.
 # 厂商改价或换计费模式时, 改这里, llm_audit 表里 cost_usd 自动跟着变.
