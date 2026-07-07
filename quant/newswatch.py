@@ -4,7 +4,7 @@
   1. 按 sources.yaml 各 feed 的 fetch_interval 轮询
   2. 去重 (news_archive 表 url unique constraint)
   3. 关键词预筛 (keywords_priority) - drop 体育/娱乐
-  4. 剩下的丢给 LLM (qwen) 评级 severity 0-10 + classify category
+  4. 剩下的按 SEVERITY_BATCH_SIZE 分批, 一次 LLM 调用给一批新闻评级 severity 0-10 + classify category
   5. severity ≥ 4 → 调 event_impact 推演影响
   6. severity ≥ 7 → 立即推 Telegram
   7. severity 4-6 → 入 events 表, 等日报汇总
@@ -30,6 +30,9 @@ from . import db, llm_router, telegram, similar_event, prompts, fetcher
 
 log = logging.getLogger(__name__)
 
+# How many kw-filter-passed items go into one score_severity_batch LLM call.
+# Trades off call-count reduction against per-item scoring quality/prompt size.
+SEVERITY_BATCH_SIZE = 15
 
 # Prompts now live in /data2/quant/prompts/*.md — see quant.prompts module.
 # Edit the .md file to change wording; no Python edit needed.
@@ -155,6 +158,71 @@ def score_severity(item: dict, *, kw_boost: int = 0,
         "mentioned_holdings": out.get("mentioned_holdings", []) or [],
         "reasoning": out.get("reasoning", ""),
     }
+
+
+def _default_sev_info(reasoning: str = "") -> dict:
+    return {"severity": 0, "category": "other", "reasoning": reasoning,
+            "portfolio_relevance": "none", "mentioned_holdings": []}
+
+
+def score_severity_batch(items: list[dict], *, kw_boosts: list[int] | None = None,
+                          portfolio: dict | None = None) -> list[dict]:
+    """Score multiple items in one LLM call — same output shape as score_severity,
+    one dict per input item in the same order.
+
+    Why: newswatch used to call score_severity once per kw-filter-passed item,
+    which meant total daily LLM calls scaled with total new article count across
+    all feeds (~100-250/day) regardless of polling cadence. Batching amortizes
+    the call count without changing what gets scored or the scoring criteria.
+    """
+    if not items:
+        return []
+    kw_boosts = kw_boosts if kw_boosts is not None else [0] * len(items)
+    portfolio_str = _portfolio_lines(portfolio)
+    blocks = [
+        f"[id={i}]\n来源: {item['source']} ({item.get('region', '?')})\n"
+        f"标题: {item['title']}\n摘要: {item['content'][:600]}"
+        for i, item in enumerate(items)
+    ]
+    user_msg = "\n\n".join(blocks)
+    try:
+        out = llm_router.chat_json(
+            user_msg,
+            task="simple_chat",
+            system=prompts.load("newswatch_severity_batch").format(portfolio=portfolio_str),
+            max_tokens=250 * len(items) + 300,
+            timeout=120,
+        )
+        by_id = {}
+        for entry in out.get("results", []) if isinstance(out, dict) else []:
+            if isinstance(entry, dict) and "id" in entry:
+                by_id[entry["id"]] = entry
+    except Exception as e:  # noqa: BLE001
+        log.warning("batch severity scoring failed (%d items): %s", len(items), e)
+        by_id = {}
+
+    results = []
+    for i, boost in enumerate(kw_boosts):
+        entry = by_id.get(i)
+        if entry is None:
+            log.warning("batch severity missing/failed for id=%d, defaulting to 0", i)
+            results.append(_default_sev_info("batch scoring missed this item"))
+            continue
+        sev = entry.get("severity", 0)
+        if isinstance(sev, str):
+            try:
+                sev = int(sev)
+            except ValueError:
+                sev = 0
+        sev = min(10, max(0, int(sev) + boost))
+        results.append({
+            "severity": sev,
+            "category": entry.get("category", "other"),
+            "portfolio_relevance": entry.get("portfolio_relevance", "none"),
+            "mentioned_holdings": entry.get("mentioned_holdings", []) or [],
+            "reasoning": entry.get("reasoning", ""),
+        })
+    return results
 
 
 # ---- Per-holding snapshot for impact prompt ----
@@ -536,12 +604,9 @@ def _mark_pushed(event_id: int) -> None:
         conn.commit()
 
 
-def process_item(news_id: int, item: dict, kw_cfg: dict, push_threshold: int) -> dict | None:
-    """Score one item, derive impact if material, push if high severity."""
-    keep, kw_boost = _kw_filter(item["title"], item["content"], kw_cfg)
-    if not keep:
-        return None
-    sev_info = score_severity(item, kw_boost=kw_boost)
+def process_item(news_id: int, item: dict, sev_info: dict, push_threshold: int) -> dict | None:
+    """Derive impact if material, push if high severity. Severity is scored upstream
+    (batched across items in run_once) so this only handles the post-scoring gate."""
     if sev_info["severity"] < 4:
         return None  # ignore low-impact noise
 
@@ -575,7 +640,8 @@ def process_item(news_id: int, item: dict, kw_cfg: dict, push_threshold: int) ->
 
 
 # ---- Main loop ----
-def run_once(*, sources_filter: set[str] | None = None, push_threshold: int = 7) -> int:
+def run_once(*, sources_filter: set[str] | None = None, push_threshold: int = 7,
+             batch_size: int = SEVERITY_BATCH_SIZE) -> int:
     sources = cfg_mod.load("sources")
     db.init()
     feeds = sources.get("rss_feeds", [])
@@ -591,14 +657,28 @@ def run_once(*, sources_filter: set[str] | None = None, push_threshold: int = 7)
     new_items = _dedupe_and_store(all_items)
     log.info("%d new items after dedup", len(new_items))
 
-    n_events = 0
+    # Cheap rule-based pre-filter before spending an LLM call.
+    filtered: list[tuple[int, dict, int]] = []  # (news_id, item, kw_boost)
     for nid, it in new_items:
-        try:
-            r = process_item(nid, it, kw_cfg, push_threshold=push_threshold)
-            if r:
-                n_events += 1
-        except Exception as e:  # noqa: BLE001
-            log.exception("process_item failed for %s: %s", it["url"], e)
+        keep, kw_boost = _kw_filter(it["title"], it["content"], kw_cfg)
+        if keep:
+            filtered.append((nid, it, kw_boost))
+    log.info("%d items pass keyword pre-filter", len(filtered))
+
+    n_events = 0
+    for start in range(0, len(filtered), batch_size):
+        chunk = filtered[start:start + batch_size]
+        sev_infos = score_severity_batch(
+            [it for _, it, _ in chunk],
+            kw_boosts=[b for _, _, b in chunk],
+        )
+        for (nid, it, _), sev_info in zip(chunk, sev_infos):
+            try:
+                r = process_item(nid, it, sev_info, push_threshold=push_threshold)
+                if r:
+                    n_events += 1
+            except Exception as e:  # noqa: BLE001
+                log.exception("process_item failed for %s: %s", it["url"], e)
     return n_events
 
 
@@ -631,6 +711,8 @@ def main():
     ap.add_argument("--interval", type=int, default=300, help="loop interval seconds")
     ap.add_argument("--threshold", type=int, default=7, help="severity to push immediately")
     ap.add_argument("--sources", help="comma-separated source names to filter")
+    ap.add_argument("--batch-size", type=int, default=SEVERITY_BATCH_SIZE,
+                     help="items scored per LLM call")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(
@@ -639,7 +721,8 @@ def main():
     )
     src = set(args.sources.split(",")) if args.sources else None
     if args.once:
-        n = run_once(sources_filter=src, push_threshold=args.threshold)
+        n = run_once(sources_filter=src, push_threshold=args.threshold,
+                      batch_size=args.batch_size)
         print(f"newswatch: {n} events processed")
     else:
         loop(interval_seconds=args.interval, push_threshold=args.threshold)

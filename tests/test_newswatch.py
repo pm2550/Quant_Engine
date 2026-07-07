@@ -331,6 +331,98 @@ def test_score_severity_injects_portfolio_into_system_prompt(monkeypatch):
     assert out["portfolio_relevance"] == "medium"
 
 
+# ---- score_severity_batch: one LLM call scores multiple items ----
+
+
+def _batch_items(n=3):
+    return [
+        {"title": f"headline {i}", "content": f"body {i}", "source": "reuters", "region": "US"}
+        for i in range(n)
+    ]
+
+
+def test_score_severity_batch_empty_returns_empty(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("should not call LLM for empty batch")
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", boom)
+    assert newswatch.score_severity_batch([]) == []
+
+
+def test_score_severity_batch_aligns_results_by_id(monkeypatch):
+    """Response order may differ from input order — must align by id, not position."""
+    def fake_chat_json(prompt, *, task, system, **kw):
+        return {"results": [
+            {"id": 2, "severity": 3, "category": "other",
+             "portfolio_relevance": "none", "mentioned_holdings": [], "reasoning": "c"},
+            {"id": 0, "severity": 8, "category": "macro",
+             "portfolio_relevance": "high", "mentioned_holdings": ["VOO"], "reasoning": "a"},
+            {"id": 1, "severity": 5, "category": "industry",
+             "portfolio_relevance": "low", "mentioned_holdings": [], "reasoning": "b"},
+        ]}
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", fake_chat_json)
+    out = newswatch.score_severity_batch(_batch_items(3))
+    assert [o["severity"] for o in out] == [8, 5, 3]
+    assert out[0]["mentioned_holdings"] == ["VOO"]
+
+
+def test_score_severity_batch_applies_per_item_kw_boost(monkeypatch):
+    def fake_chat_json(prompt, *, task, system, **kw):
+        return {"results": [
+            {"id": 0, "severity": 5, "category": "macro",
+             "portfolio_relevance": "medium", "mentioned_holdings": [], "reasoning": "a"},
+            {"id": 1, "severity": 5, "category": "macro",
+             "portfolio_relevance": "medium", "mentioned_holdings": [], "reasoning": "b"},
+        ]}
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", fake_chat_json)
+    out = newswatch.score_severity_batch(_batch_items(2), kw_boosts=[2, 0])
+    assert out[0]["severity"] == 7
+    assert out[1]["severity"] == 5
+
+
+def test_score_severity_batch_missing_id_defaults_to_zero(monkeypatch):
+    """If the model drops an item from its response, that slot must not crash —
+    it should default to severity 0 while the rest still score normally."""
+    def fake_chat_json(prompt, *, task, system, **kw):
+        return {"results": [
+            {"id": 0, "severity": 7, "category": "macro",
+             "portfolio_relevance": "high", "mentioned_holdings": [], "reasoning": "a"},
+            # id=1 missing entirely
+        ]}
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", fake_chat_json)
+    out = newswatch.score_severity_batch(_batch_items(2))
+    assert out[0]["severity"] == 7
+    assert out[1]["severity"] == 0
+
+
+def test_score_severity_batch_llm_failure_defaults_all_to_zero(monkeypatch):
+    """A whole-batch LLM failure must not raise — every item degrades to severity 0,
+    matching score_severity's single-item error behavior."""
+    def boom(*a, **k):
+        raise RuntimeError("all backends failed")
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", boom)
+    out = newswatch.score_severity_batch(_batch_items(3))
+    assert len(out) == 3
+    assert all(o["severity"] == 0 for o in out)
+
+
+def test_score_severity_batch_injects_portfolio_and_ids(monkeypatch):
+    captured = {}
+
+    def fake_chat_json(prompt, *, task, system, **kw):
+        captured["system"] = system
+        captured["prompt"] = prompt
+        return {"results": [
+            {"id": 0, "severity": 4, "category": "other",
+             "portfolio_relevance": "none", "mentioned_holdings": [], "reasoning": "a"},
+        ]}
+    monkeypatch.setattr(newswatch.llm_router, "chat_json", fake_chat_json)
+    portfolio = {"positions": {"VOO": {"name": "Vanguard S&P", "shares": 1, "currency": "USD"}},
+                 "watchlist": []}
+    newswatch.score_severity_batch(_batch_items(1), portfolio=portfolio)
+    assert "VOO" in captured["system"]
+    assert "[id=0]" in captured["prompt"]
+
+
 # ---- v3 architecture: LLM does NOT write magnitude; engine computes base rate ----
 
 
