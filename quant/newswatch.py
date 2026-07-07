@@ -462,22 +462,14 @@ def render_alert(item: dict, severity_info: dict, impact: dict) -> str:
         f"_{item['source']} • {item.get('published_at','')[:10]}_",
         "",
     ]
-    if impact.get("summary"):
-        lines.append(f"💡 {impact['summary']}")
-        lines.append("")
-
+    # 只展示真实数据: 相关持仓 + 历史相似事件 base rate. 不展示 LLM 方向/置信/关联猜测/行动提示
+    # (审计 LLM 方向 hit≈50%, 等于瞎猜; 每日摘要早已隐藏, 立即告警同步隐藏).
     impacts = impact.get("impacts", [])
     if impacts:
-        lines.append("*持仓影响 (LLM 方向 + 历史 base rate):*")
+        lines.append("*相关持仓 (历史相似事件统计, 非预测):*")
         for imp in impacts:
             sym = imp.get("symbol", "?")
-            d = imp.get("direction", "neutral")
-            conf = imp.get("confidence", 0)
             br = imp.get("base_rate")
-            # Header line: direction + confidence + reasoning (no LLM magnitude!)
-            lines.append(f"  {_direction_emoji(d)} `{sym}` {d} (置信 {conf:.1f}) — "
-                          f"{imp.get('reasoning','')[:100]}")
-            # Sub-line: real base rate from similar historical events
             if br and br.get("n_samples", 0) > 0:
                 fr5 = br.get("fwd_5d_pct")
                 fr20 = br.get("fwd_20d_pct")
@@ -489,22 +481,11 @@ def render_alert(item: dict, severity_info: dict, impact: dict) -> str:
                     pieces.append(f"20d 中位 {fr20['median']:+.1f}% [{fr20['min']:+.1f},{fr20['max']:+.1f}]")
                 if dd:
                     pieces.append(f"20d 最大回撤中位 {dd['median']:.1f}%")
-                if pieces:
-                    n = max((fr5 or {}).get("n", 0), (fr20 or {}).get("n", 0))
-                    lines.append(f"    历史 n={n}: " + " | ".join(pieces))
+                n = max((fr5 or {}).get("n", 0), (fr20 or {}).get("n", 0))
+                lines.append(f"  `{sym}` 历史 n={n}: " + " | ".join(pieces) if pieces else f"  `{sym}`")
             else:
-                lines.append("    历史: 无足够样本 (n<1) — 仅 LLM 定性判断")
+                lines.append(f"  `{sym}` — 历史无足够样本, 不做方向判断")
         lines.append("")
-
-    sec = impact.get("secondary_assets", [])
-    if sec:
-        lines.append("*关联资产 (无历史 base rate):*")
-        for s in sec[:3]:
-            lines.append(f"  • {s.get('asset','?')}: {s.get('direction','?')} — {s.get('reasoning','')[:80]}")
-        lines.append("")
-
-    if impact.get("action_hint"):
-        lines.append(f"🎯 *提示:* {impact['action_hint']}")
 
     # 历史相似事件 (向量检索)
     try:

@@ -109,18 +109,19 @@ def _impact(summary="Risk-on for big tech",
 
 
 def test_render_alert_includes_severity_and_title(monkeypatch):
+    """v4: matches current render_alert, which no longer renders impact['summary']."""
     monkeypatch.setattr(newswatch.similar_event, "lookup_for_alert", lambda *a, **k: [])
     out = newswatch.render_alert(_item(), _sev(8, "macro"), _impact())
     assert "事件等级 8/10" in out
     assert "macro" in out
     assert "Fed cuts rates 50bp" in out
     assert "🚨" in out  # severity 8
-    assert "Risk-on for big tech" in out
     assert "reuters.com" in out
 
 
 def test_render_alert_per_holding_lines(monkeypatch):
-    """v3: render shows direction + base_rate (n=X 中位 ...), not LLM-magnitude."""
+    """v4: render shows base_rate (n=X 中位 ...) only — no LLM direction/confidence
+    (accuracy audit found direction hit-rate ~50%, i.e. a coin flip)."""
     monkeypatch.setattr(newswatch.similar_event, "lookup_for_alert", lambda *a, **k: [])
     impacts = [
         {"symbol": "VOO", "direction": "bullish", "confidence": 0.8,
@@ -134,11 +135,13 @@ def test_render_alert_per_holding_lines(monkeypatch):
          "reasoning": "limited direct exposure", "base_rate": None},
     ]
     out = newswatch.render_alert(_item(), _sev(7), _impact(impacts=impacts))
-    assert "持仓影响" in out
-    assert "`VOO`" in out and "📈" in out
+    assert "相关持仓" in out
+    assert "`VOO`" in out
     assert "5d 中位 +1.2%" in out  # base rate, NOT LLM-written magnitude
-    assert "`GRID`" in out and "➖" in out
+    assert "`GRID`" in out
     assert "无足够样本" in out  # GRID has no base_rate
+    assert "bullish" not in out and "📈" not in out  # direction guess dropped
+    assert "0.8" not in out  # confidence dropped
 
 
 def test_render_alert_filters_low_similarity(monkeypatch):
@@ -166,15 +169,16 @@ def test_render_alert_handles_similar_lookup_failure(monkeypatch):
     assert "历史相似事件" not in out
 
 
-def test_render_alert_action_hint_appears_when_present(monkeypatch):
-    """v3 renamed 'action_suggestion' → 'action_hint' (no specific dollar amounts)."""
+def test_render_alert_action_hint_no_longer_rendered(monkeypatch):
+    """v4: action_hint (an LLM guess) is dropped from alerts along with direction/
+    confidence — same accuracy-audit rationale."""
     monkeypatch.setattr(newswatch.similar_event, "lookup_for_alert", lambda *a, **k: [])
     out = newswatch.render_alert(_item(), _sev(8),
                                   {"summary": "x", "impacts": [],
                                    "secondary_assets": [],
                                    "action_hint": "等待回调"})
-    assert "🎯" in out
-    assert "等待回调" in out
+    assert "🎯" not in out
+    assert "等待回调" not in out
 
 
 # ---- Portfolio context injection (P0 fix) ----
@@ -427,8 +431,9 @@ def test_render_alert_shows_base_rate_not_llm_magnitude(monkeypatch):
     assert "5d 中位 -1.5%" in out
     assert "20d 中位 -3.2%" in out
     assert "n=8" in out
-    # Must NOT show a fabricated single magnitude
-    assert "(置信 0.7)" in out
+    # v4: must NOT show LLM-written confidence/direction either, only real base rate
+    assert "置信" not in out
+    assert "bearish" not in out
 
 
 def test_render_alert_no_base_rate_shows_disclaimer(monkeypatch):
