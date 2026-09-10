@@ -32,9 +32,21 @@ HEADERS = {
 
 # Default keywords to track for known A-share holdings.
 # Owner can extend via CLI or by editing this dict.
+#
+# A5 (2026-09-10): 原来是 4 个词 ["异环","完美世界 异环","诛仙世界","完美新作"],
+# 全指向同一只股票, 结果同一天产出 4 个互相矛盾的情绪值 (+0.70/+0.15/−0.20/+0.60),
+# 日报里占掉 46 行 (整份报告的 36%)。而且宽松的搜索词会把无关视频卷进来 ——
+# "完美新作" 命中过黑神话悟空和"城市大富翁"。
+# 收敛到 1 个精确词: 异环 (该公司当前唯一有量的在研产品, 也是股价的主要叙事)。
+# 要加词请确认: (a) 对应一个独立的营收/叙事来源, (b) 搜索结果不被无关内容污染。
 DEFAULT_KEYWORDS = {
-    "002624.SZ": ["异环", "完美世界 异环", "诛仙世界", "完美新作"],
+    "002624.SZ": ["异环"],
 }
+
+# A4: total_results 是 B 站搜索接口的分页上限 (恒为 1000), 不是真实视频数。
+# 以它算出来的 7d/30d 趋势永远是 0.0% —— 这个指标从上线第一天就是死的。
+# 活的指标: top_avg_plays (播放量) 和 recent_7d_in_top30 (发布速度)。
+TOTAL_RESULTS_CAP = 1000
 
 
 def _fetch_search(keyword: str, *, page: int = 1, order: str = "pubdate") -> dict:
@@ -70,6 +82,21 @@ def snapshot_keyword(keyword: str) -> dict:
     pubdate_results = by_pubdate.get("result") or []
     click_results = by_click.get("result") or []
 
+    # A7 (2026-09-10): B 站偶发忽略 order=click, 返回按相关度排序的结果 —— 不报错,
+    # 只是 top_avg_plays 悄悄变成完全不同的数量级。实测同一天同一关键词:
+    #   正常 (按播放降序): top20 均播 5,893,843
+    #   降级 (未排序):     top20 均播   433,885   ← 差 13 倍
+    # 这个垃圾值随后会让 anomaly.py 触发一次假的 "top20 均播 7d −92.6%" 告警。
+    # 所以这里显式校验"是否真的按播放降序", 不可靠就标记出来, 由 trend/anomaly 跳过。
+    _plays = [int(v.get("play") or 0) for v in click_results[:20]]
+    top_plays_reliable = bool(
+        len(_plays) >= 2
+        and all(_plays[i] >= _plays[i + 1] for i in range(len(_plays) - 1))
+    )
+    if not top_plays_reliable and _plays:
+        log.warning("bilibili order=click 降级 (%s): 结果未按播放降序, top_avg_plays 不可信",
+                     keyword)
+
     # Top-N most-played (proxy for "is anyone watching this content?")
     top_n = min(20, len(click_results))
     top_videos = []
@@ -94,11 +121,16 @@ def snapshot_keyword(keyword: str) -> dict:
     recent_7d = sum(1 for v in pubdate_results[:30]
                      if (v.get("pubdate") or 0) >= cutoff_ts)
 
+    total_i = int(total)
     return {
-        "total_results": int(total),
+        "total_results": total_i,
+        # A4: 撞上分页上限时这个数没有信息量, 下游 (trend / anomaly / formatter)
+        # 必须据此跳过基于 total_results 的趋势判断。
+        "total_results_capped": total_i >= TOTAL_RESULTS_CAP,
         "top_n": top_n,
         "top_plays_sum": top_plays_sum,
         "top_avg_plays": top_plays_sum // max(top_n, 1),
+        "top_plays_reliable": top_plays_reliable,    # A7
         "recent_7d_in_top30": recent_7d,
         "top_videos": top_videos,
         "sentiment": analyze_with_llm(keyword, top_videos),
@@ -128,10 +160,9 @@ def analyze_with_llm(keyword: str, top_videos: list[dict]) -> dict:
         top_videos_text="\n".join(lines),
     )
     try:
-        # Use format task (dashscope qwen3.6-plus) — supports response_format=json_object
-        # strict mode. dashscope-proxy injects enable_thinking=true so timeout must
-        # accommodate thinking budget; max_tokens 1500 leaves headroom for thinking
-        # tokens which would otherwise eat into the JSON output budget.
+        # task="format" → ollama:glm-5.1 (json mode), 见 config/llm_routes.yaml。
+        # 历史上这里走 dashscope qwen3.6-plus, 该 provider 2026-06-01 随 coding plan
+        # 到期下线。thinking-mode 模型会占用输出预算, 所以 max_tokens 留 1500 余量。
         out = llm_router.chat_json(
             prompt, task="format", max_tokens=1500, timeout=300,
         )
@@ -201,25 +232,50 @@ def trend(keyword: str, *, source: str = "bilibili_search",
             return None
         return round((a / b - 1) * 100, 2)
 
+    def _capped(rec: dict) -> bool:
+        """A4: 历史行没有 total_results_capped 字段, 按数值回推。"""
+        v = rec.get("total_results_capped")
+        if v is not None:
+            return bool(v)
+        return int(rec.get("total_results") or 0) >= TOTAL_RESULTS_CAP
+
+    # A4: 任一端撞上分页上限, total_results 的变化率就是假的 —— 返回 None 而不是 0.0%,
+    # 让下游能区分"没变化"和"测不出来"。
+    cap_now = _capped(last)
+    def _total_pct(ref: dict):
+        if cap_now or _capped(ref):
+            return None
+        return _pct(last.get("total_results", 0), ref.get("total_results", 0))
+
+    def _reliable(rec: dict) -> bool:
+        """A7: 历史行没有这个字段, 当作可靠 (那时还没有降级检测)。"""
+        v = rec.get("top_plays_reliable")
+        return True if v is None else bool(v)
+
+    plays_ok_now = _reliable(last)
+    def _plays_pct(ref: dict):
+        if not plays_ok_now or not _reliable(ref):
+            return None
+        return _pct(last.get("top_avg_plays", 0), ref.get("top_avg_plays", 0))
+
     return {
         "keyword": keyword,
         "n_snapshots": len(parsed),
+        "total_results_capped": cap_now,
+        "top_plays_reliable": plays_ok_now,
         "today": {"date": last["date"], "total_results": last.get("total_results"),
+                   "total_results_capped": cap_now,
                    "top_avg_plays": last.get("top_avg_plays"),
                    "recent_7d_in_top30": last.get("recent_7d_in_top30")},
         "vs_7d_ago": {
             "date": week_ago["date"],
-            "total_results_pct": _pct(last.get("total_results", 0),
-                                        week_ago.get("total_results", 0)),
-            "top_avg_plays_pct": _pct(last.get("top_avg_plays", 0),
-                                        week_ago.get("top_avg_plays", 0)),
+            "total_results_pct": _total_pct(week_ago),
+            "top_avg_plays_pct": _plays_pct(week_ago),
         },
         "vs_30d_ago": {
             "date": month_ago["date"],
-            "total_results_pct": _pct(last.get("total_results", 0),
-                                        month_ago.get("total_results", 0)),
-            "top_avg_plays_pct": _pct(last.get("top_avg_plays", 0),
-                                        month_ago.get("top_avg_plays", 0)),
+            "total_results_pct": _total_pct(month_ago),
+            "top_avg_plays_pct": _plays_pct(month_ago),
         },
     }
 

@@ -23,6 +23,8 @@ per-symbol cross-sectional level where macro broadcast is poison.
 from __future__ import annotations
 
 import logging
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -192,8 +194,35 @@ def compute() -> dict:
     }
 
 
-def render_section() -> str:
-    """One-block TG-friendly markdown for the daily digest."""
+STATE_FILE = Path("/data2/quant/results/macro_regime_state.json")
+SCORE_MOVE_THRESHOLD = 10     # 分数挪动超过这么多也算值得播报
+
+
+def _last_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_state(band: str, score: float) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(
+            {"band": band, "score": round(float(score), 1),
+             "saved_at": datetime.utcnow().isoformat()}, ensure_ascii=False))
+    except Exception as e:  # noqa: BLE001
+        log.warning("macro_regime state 保存失败: %s", e)
+
+
+def render_section(*, only_on_change: bool = False, one_line: bool = False) -> str:
+    """宏观风险面板。
+
+    E7 (2026-09-10): 之前无条件输出 11 行, 而分档经常连续多日不变 (连着多天
+    "🟢 低风险 25/100")。现在:
+      only_on_change=True → 分档没变且分数挪动 <10 时返回空串
+      one_line=True       → 只出一行摘要, 详情留给周报
+    """
     r = compute()
     score = r.get("score_0_100", 50)
     band = r.get("band", "")
@@ -202,11 +231,23 @@ def render_section() -> str:
     if not signals:
         return ""
 
-    lines = [
-        f"🌐 *宏观风险面板 {band} {score:.0f}/100*",
-        f"_建议持仓上限 ~{exp}% (regime overlay, 不替代每只股票决策)_",
-        "",
-    ]
+    prev = _last_state()
+    changed = (prev.get("band") != band
+               or abs(float(prev.get("score", -999)) - float(score)) >= SCORE_MOVE_THRESHOLD)
+    _save_state(band, score)
+
+    if only_on_change and not changed:
+        log.info("macro_regime 分档未变 (%s %.0f), 跳过面板", band, score)
+        return ""
+
+    head = f"🌐 *宏观 {band} {score:.0f}/100* · 建议持仓上限 ~{exp}%"
+    if changed and prev:
+        head += f" _(上次 {prev.get('band','?')} {prev.get('score','?')})_"
+    if one_line:
+        worst = max(signals, key=lambda s: s["risk_contrib"])
+        return f"{head} · 主要压力: {worst['name']} {worst['interpretation']}"
+
+    lines = [head, ""]
     for s in signals:
         rc = s["risk_contrib"]
         marker = "🔴" if rc >= 0.6 else "🟠" if rc >= 0.3 else "🟢"

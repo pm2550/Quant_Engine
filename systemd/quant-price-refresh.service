@@ -1,0 +1,19 @@
+[Unit]
+Description=Refresh price cache for the full challenger universe (A1 fix, 2026-09-10)
+Documentation=file:///data2/quant/docs/AUDIT-20260910.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+EnvironmentFile=/data2/quant/secrets/secrets.env
+# --stale-only: 只补落后 >2 天的, 正常日约 150 只 × 0.35s ≈ 1 分钟
+ExecStart=/data2/quant/venv/bin/python -m quant.price_refresh --stale-only
+# 顺手隔离 >45 天没新数据的 (退市/改名), 否则它们会一直产出陈旧预测
+ExecStartPost=/data2/quant/venv/bin/python -m quant.price_refresh --quarantine
+StandardOutput=append:/data2/quant/logs/price_refresh.log
+StandardError=append:/data2/quant/logs/price_refresh.err
+TimeoutStartSec=2400

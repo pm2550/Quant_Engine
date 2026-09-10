@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,8 @@ import pandas as pd
 from quant.ml import features as ml_features
 from quant.ml import macro as ml_macro
 from quant.ml import edgar as ml_edgar
+
+log = logging.getLogger(__name__)
 
 PRICES_DIR = Path("/data2/quant/data/prices")
 
@@ -33,6 +36,9 @@ def _load_parquet(symbol: str) -> pd.DataFrame:
 
 
 HORIZON_DAYS = 20
+
+# 验证集必须覆盖训练集至少这么高比例的标的, 否则拒绝训练 (见 train_full 里的注释)
+MIN_VAL_SYMBOL_COVERAGE = 0.70
 
 
 def _load_all(symbols: list[str]) -> dict[str, pd.DataFrame]:
@@ -288,6 +294,27 @@ def train_full(big: pd.DataFrame, *, save_path: str | Path,
     val_mask = big.index.get_level_values("date") >= val_cutoff
     train = big[train_mask]
     val = big[val_mask]
+
+    # ---- 验证集代表性检查 (2026-09-10) ---------------------------------------
+    # 踩过的坑: dates 是**池化**后所有标的日期的并集, 所以 dates[-60] 这个切点只要求
+    # "至少有一只标的还在更新"。2026-05~09 期间 159 只里只有 16 只的 parquet 还在刷
+    # (其余冻结在 2026-05-26 等), 于是:
+    #     训练集 = 156 只混合年份数据 (525,259 行)
+    #     验证集 = 仅约 20 只仍新鲜的标的 (1,798 行, 292:1)
+    # 而验证集是**决定早停轮数**的那一份。等于拿一个十几只、高度相关的半导体截面去
+    # 给一个 156 只宇宙的模型调参 —— 这就是 CV 看着 IC +0.049、实盘逐日截面 IC −0.216
+    # 的机制。价格刷新 (quant.price_refresh) 修掉了成因, 这里加哨兵防止复发。
+    train_syms = train.index.get_level_values("symbol").nunique()
+    val_syms = val.index.get_level_values("symbol").nunique()
+    coverage = val_syms / max(train_syms, 1)
+    log.warning("train %d 行/%d 只  |  val %d 行/%d 只 (覆盖 %.0f%%)",
+                len(train), train_syms, len(val), val_syms, coverage * 100)
+    if coverage < MIN_VAL_SYMBOL_COVERAGE:
+        raise ValueError(
+            f"验证集只覆盖 {val_syms}/{train_syms} 只标的 ({coverage:.0%}), "
+            f"低于 {MIN_VAL_SYMBOL_COVERAGE:.0%} 门槛 —— 早停会在错的分布上决定。"
+            f"先跑 `python -m quant.price_refresh --stale-only` 补齐价格再重训。"
+        )
 
     params = {
         "objective": "regression",

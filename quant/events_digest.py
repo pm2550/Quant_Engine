@@ -63,9 +63,19 @@ def _events_with_holding_overlap(events: list[dict], holdings: set[str],
     return out
 
 
-def render_section(*, hours: int = 24, top_k: int = 6,
-                    min_overlap: int = 2) -> str:
-    """Render the consolidated events section. Empty string if nothing meaningful."""
+MIN_BASE_RATE_N = 30     # E6: 低于这个样本量的历史中位数不展示 —— 没有决策价值
+
+
+def render_section(*, hours: int = 24, top_k: int = 2,
+                    min_overlap: int = 2, show_base_rate: bool = True) -> str:
+    """Render the consolidated events section. Empty string if nothing meaningful.
+
+    E6 (2026-09-10):
+      · top_k 6 → 2。日报里这段占 22 行, 而每天 sev≥6 的事件本就高度同质
+        (同一则地缘新闻被拆成 4 条), 看前 2 条足够, 全量查 /api/events。
+      · base rate 加 n>=30 门槛。之前 n=7~15 也照印 "20d 中位 +2.9% [-1.2,+3.6]",
+        那个样本量的中位数和区间都没有决策价值, 反而因为带着数字显得很确定。
+    """
     holdings = _portfolio_symbols()
     if not holdings:
         return ""
@@ -78,9 +88,10 @@ def render_section(*, hours: int = 24, top_k: int = 6,
     notable = sorted(notable, key=lambda e: (e["severity"], e["fired_at"]),
                       reverse=True)[:top_k]
 
+    total_notable = len(notable)
     lines = [
-        f"📰 *今日重大事件 ({len(notable)} 条)*",
-        f"_过去 {hours}h, sev≥6, 至少命中 {min_overlap} 只持仓; LLM 方向预测已隐藏 (经审计 hit≈50%)_",
+        f"📰 *今日重大事件* (前 {len(notable)} / 共 {total_notable} 条)",
+        f"_过去 {hours}h, sev≥6, 命中 ≥{min_overlap} 只持仓; 全量见 /api/events_",
         "",
     ]
     for e in notable:
@@ -107,7 +118,7 @@ def render_section(*, hours: int = 24, top_k: int = 6,
             br = imp.get("base_rate") or {}
             fr20 = br.get("fwd_20d_pct") or {}
             n = (fr20 or {}).get("n", 0)
-            if n >= 3:
+            if show_base_rate and n >= MIN_BASE_RATE_N:
                 med = fr20.get("median")
                 lo = fr20.get("min")
                 hi = fr20.get("max")

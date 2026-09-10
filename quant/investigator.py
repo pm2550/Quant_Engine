@@ -141,7 +141,8 @@ def _llm_summarize(symbol: str, name: Optional[str], anomaly: dict,
         f"\n搜索结果 ({len(results)} 条):\n{results_str}"
     )
     try:
-        # task="format" routes to dashscope qwen3.6-plus with json_object mode.
+        # task="format" routes to ollama:glm-5.1 (json mode) per config/llm_routes.yaml.
+        # 历史上这里走 dashscope qwen3.6-plus, 该 provider 2026-06-01 下线。
         # Avoid thinking-mode (kimi-k2-thinking) which prepends prose breaking JSON parse.
         out = llm_router.chat_json(
             user_msg,

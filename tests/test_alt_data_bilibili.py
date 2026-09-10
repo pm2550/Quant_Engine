@@ -1,9 +1,21 @@
 """Unit tests for alt_data.bilibili — store/trend math (network calls mocked)."""
 from __future__ import annotations
+from datetime import date, timedelta
 from pathlib import Path
 import tempfile
 
 import pytest
+
+
+# trend() 只看 `metric_date >= date('now', '-30 days')`。这些测试原先硬编码
+# "2026-04-28" / "2026-05-06" —— 写的时候落在 30 天窗口内, 真实时间走过之后就
+# 永久失败 (2026-09 跑时全部返回 n_snapshots=0)。改成相对日期彻底消掉这个定时炸弹。
+def _days_ago(n: int) -> str:
+    return (date.today() - timedelta(days=n)).isoformat()
+
+
+TODAY = _days_ago(0)
+EIGHT_DAYS_AGO = _days_ago(8)
 
 
 @pytest.fixture
@@ -21,18 +33,18 @@ def test_store_snapshot_writes_row(temp_db):
     from quant.alt_data import bilibili
     metrics = {"total_results": 1000, "top_avg_plays": 100000,
                 "recent_7d_in_top30": 15, "top_videos": []}
-    bilibili.store_snapshot("异环", metrics, metric_date="2026-05-06")
+    bilibili.store_snapshot("异环", metrics, metric_date=TODAY)
     with temp_db.conn() as c:
         row = c.execute("SELECT * FROM alt_data_metrics WHERE key='异环'").fetchone()
     assert row["source"] == "bilibili_search"
-    assert row["metric_date"] == "2026-05-06"
+    assert row["metric_date"] == TODAY
 
 
 def test_store_snapshot_idempotent_on_same_day(temp_db):
     """REPLACE on same (source, key, metric_date) should not duplicate."""
     from quant.alt_data import bilibili
-    bilibili.store_snapshot("X", {"total_results": 100}, metric_date="2026-05-06")
-    bilibili.store_snapshot("X", {"total_results": 200}, metric_date="2026-05-06")
+    bilibili.store_snapshot("X", {"total_results": 100}, metric_date=TODAY)
+    bilibili.store_snapshot("X", {"total_results": 200}, metric_date=TODAY)
     with temp_db.conn() as c:
         n = c.execute("SELECT COUNT(*) FROM alt_data_metrics WHERE key='X'").fetchone()[0]
     assert n == 1
@@ -40,7 +52,7 @@ def test_store_snapshot_idempotent_on_same_day(temp_db):
 
 def test_trend_needs_at_least_2_snapshots(temp_db):
     from quant.alt_data import bilibili
-    bilibili.store_snapshot("X", {"total_results": 100}, metric_date="2026-05-06")
+    bilibili.store_snapshot("X", {"total_results": 100}, metric_date=TODAY)
     out = bilibili.trend("X")
     assert "error" in out
 
@@ -51,11 +63,11 @@ def test_trend_computes_pct_changes(temp_db):
     # Older snapshot (8 days ago)
     bilibili.store_snapshot("X", {"total_results": 100, "top_avg_plays": 1000,
                                      "recent_7d_in_top30": 5},
-                              metric_date="2026-04-28")
+                              metric_date=EIGHT_DAYS_AGO)
     # Recent snapshot (today)
     bilibili.store_snapshot("X", {"total_results": 200, "top_avg_plays": 2500,
                                      "recent_7d_in_top30": 12},
-                              metric_date="2026-05-06")
+                              metric_date=TODAY)
     out = bilibili.trend("X")
     assert out["n_snapshots"] == 2
     assert out["today"]["total_results"] == 200
@@ -138,7 +150,7 @@ def test_formatter_renders_keyword_block(temp_db):
             "reasoning": "正面主导",
         },
     }
-    bilibili.store_snapshot("异环 完美世界", metrics, metric_date="2026-05-06")
+    bilibili.store_snapshot("异环 完美世界", metrics, metric_date=TODAY)
     out = formatter.render_for_keyword("异环 完美世界", "002624.SZ")
     assert "002624.SZ" in out
     assert "异环 完美世界" in out
@@ -158,18 +170,22 @@ def test_formatter_no_snapshot_returns_empty(temp_db):
 
 def test_anomaly_volume_drop_fires(monkeypatch, temp_db):
     from quant.alt_data import bilibili, anomaly
-    # 8 days ago: 1000 videos, top_avg_plays 500k
+    # A4 (2026-09-10): total_results 必须低于 TOTAL_RESULTS_CAP (1000)。撞上 B 站搜索
+    # 接口的分页上限时, 计数变化率是假的, trend() 现在返回 None 而不是百分比 ——
+    # 原测试用 1000→600 正好踩在上限上, 所以 volume_drop 不再触发 (这是正确行为)。
+    # 改成 900→540, 同样 -40%, 但是真实可测的区间。
+    # 8 days ago: 900 videos, top_avg_plays 500k
     bilibili.store_snapshot("异环 完美世界",
-                              {"total_results": 1000, "top_avg_plays": 500000,
+                              {"total_results": 900, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": 0.3,
                                               "buzz_phase": "early_excitement"}},
-                              metric_date="2026-04-28")
-    # Today: 600 videos (-40%), top_avg_plays 250k (-50%) — both should fire
+                              metric_date=EIGHT_DAYS_AGO)
+    # Today: 540 videos (-40%), top_avg_plays 250k (-50%) — both should fire
     bilibili.store_snapshot("异环 完美世界",
-                              {"total_results": 600, "top_avg_plays": 250000,
+                              {"total_results": 540, "top_avg_plays": 250000,
                                "sentiment": {"overall_sentiment": 0.3,
                                               "buzz_phase": "early_excitement"}},
-                              metric_date="2026-05-06")
+                              metric_date=TODAY)
     fires = anomaly.check_keyword("异环 完美世界", dry_run=True)
     sigs = {f["signal"] for f in fires}
     assert "volume_drop" in sigs
@@ -182,12 +198,12 @@ def test_anomaly_phase_shift_to_controversy_fires(monkeypatch, temp_db):
                               {"total_results": 1000, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": 0.3,
                                               "buzz_phase": "sustained"}},
-                              metric_date="2026-04-28")
+                              metric_date=EIGHT_DAYS_AGO)
     bilibili.store_snapshot("异环 完美世界",
                               {"total_results": 1000, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": 0.0,
                                               "buzz_phase": "controversy"}},
-                              metric_date="2026-05-06")
+                              metric_date=TODAY)
     fires = anomaly.check_keyword("异环 完美世界", dry_run=True)
     sigs = {f["signal"] for f in fires}
     assert "phase_shift" in sigs
@@ -199,12 +215,12 @@ def test_anomaly_sentiment_drop_fires(monkeypatch, temp_db):
                               {"total_results": 1000, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": 0.5,
                                               "buzz_phase": "sustained"}},
-                              metric_date="2026-04-28")
+                              metric_date=EIGHT_DAYS_AGO)
     bilibili.store_snapshot("异环 完美世界",
                               {"total_results": 1000, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": -0.1,
                                               "buzz_phase": "sustained"}},
-                              metric_date="2026-05-06")
+                              metric_date=TODAY)
     fires = anomaly.check_keyword("异环 完美世界", dry_run=True)
     sigs = {f["signal"] for f in fires}
     assert "sentiment_drop" in sigs
@@ -216,10 +232,10 @@ def test_anomaly_no_fire_when_stable(monkeypatch, temp_db):
                               {"total_results": 1000, "top_avg_plays": 500000,
                                "sentiment": {"overall_sentiment": 0.3,
                                               "buzz_phase": "sustained"}},
-                              metric_date="2026-04-28")
+                              metric_date=EIGHT_DAYS_AGO)
     bilibili.store_snapshot("异环 完美世界",
                               {"total_results": 1010, "top_avg_plays": 510000,
                                "sentiment": {"overall_sentiment": 0.32,
                                               "buzz_phase": "sustained"}},
-                              metric_date="2026-05-06")
+                              metric_date=TODAY)
     assert anomaly.check_keyword("异环 完美世界", dry_run=True) == []

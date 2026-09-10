@@ -38,6 +38,93 @@ WEIGHTS = {
 }
 
 
+# ---- 动作阈值 (C9/C10, 2026-09-10) ----------------------------------------
+# 原值 ADD>=0.40→0.30, WATCH_BUY>=0.15→0.10。实测 2026-05~09 的 392 条决策里,
+# composite 达到 0.30 的只有 3 条 —— 等于系统从不给买入建议, 每天输出"持有不动"。
+# 同期 composite 的 Q5 五分位均值只有 0.17。
+#
+# 用 252 条已复盘决策做阈值扫描 (训练段 05~06 / 测试段 07, 按时间切开):
+#   阈值 0.06 → 训练价差 +4.97pp, 测试价差 +8.77pp  (触发 40%)
+#   阈值 0.12 → 训练价差 +6.52pp, 测试价差 +21.46pp (触发 17~30%)   ← 选这个
+#   阈值 0.20 → 训练价差 +2.02pp, 测试样本不足
+# 两段的绝对收益天差地别 (regime 差异, 训练段 −4.8% / 测试段 +17.8%), 不能当预期;
+# 可信的是"触发组 − 未触发组"的价差, 两段都为正且在 0.12 附近最优。
+#
+# ⚠️ 样本只有 6 只 watchlist 标的、2 个月、30d 重叠窗口 → 有效独立期数约 3~4 个。
+# 所以同时加了横截面闸门 (见 apply_cross_sectional_gate): composite 的时序 IC ≈ 0
+# (AMD +0.11 / NVDA −0.39 / PLTR +0.02), 但逐日横截面 rank IC = +0.436 且 88% 的
+# 交易日为正 —— 它能分辨"今天这批里谁更强", 不能分辨"现在是不是好时机"。
+ADD_THRESHOLD = 0.12
+WATCH_BUY_THRESHOLD = 0.06
+REDUCE_THRESHOLD = -0.12
+WATCH_SKIP_THRESHOLD = -0.06
+
+# 同一天最多给几个 ADD —— 横截面闸门, 防止整个板块同涨时全部亮灯
+MAX_ADDS_PER_DAY = 3
+
+
+def action_thresholds() -> dict:
+    """允许用 config/strategies.yaml 的 multi_factor 段覆盖, 不改代码即可调参。"""
+    try:
+        cfg = (cfg_mod.load("strategies") or {}).get("multi_factor") or {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    return {
+        "add": float(cfg.get("add_threshold", ADD_THRESHOLD)),
+        "watch_buy": float(cfg.get("watch_buy_threshold", WATCH_BUY_THRESHOLD)),
+        "reduce": float(cfg.get("reduce_threshold", REDUCE_THRESHOLD)),
+        "watch_skip": float(cfg.get("watch_skip_threshold", WATCH_SKIP_THRESHOLD)),
+        "max_adds": int(cfg.get("max_adds_per_day", MAX_ADDS_PER_DAY)),
+    }
+
+
+def conviction_from_composite(composite: float, *, thresholds: dict | None = None) -> int:
+    """把 composite 映射成 0–5 星。
+
+    旧式 round(|c|*5) 要求 |c|>=0.3 才到 2 星, 而日报又按 "conviction<2 → 暂无信号"
+    过滤 —— 两道闸门叠加, 把一个截面 IC +0.44 的信号彻底掐死 (C10)。
+    现在改成锚定动作阈值: 能触发 WATCH_BUY 的至少 2 星, 能触发 ADD 的至少 3 星。
+    """
+    t = thresholds or action_thresholds()
+    add, watch = t["add"], t["watch_buy"]
+    a = abs(composite)
+    if a < watch / 2:
+        return 0
+    if a < watch:
+        return 1
+    if a < add:
+        return 2
+    if a < add * 1.75:
+        return 3
+    if a < add * 2.5:
+        return 4
+    return 5
+
+
+def apply_cross_sectional_gate(scored: list[dict], *,
+                                max_adds: int | None = None) -> list[dict]:
+    """横截面闸门: 同一天只让 composite 最高的 N 个保留 ADD, 其余降级 WATCH_BUY。
+
+    为什么需要: composite 的时序 IC ≈ 0 而逐日截面 rank IC = +0.436。也就是说
+    "它比其它标的强" 可信, "它现在绝对值得买" 不可信。不加闸门的话, 半导体板块
+    整体走强的日子会 11 只同时亮 ADD —— 那不是 11 个独立信号, 是 1 个板块信号。
+
+    原地修改并返回同一个 list (每项需有 'symbol' / 'composite_score' / 'action')。
+    """
+    t = action_thresholds()
+    cap = max_adds if max_adds is not None else t["max_adds"]
+    adds = [r for r in scored if r.get("action") == "ADD"]
+    if len(adds) <= cap:
+        return scored
+    adds.sort(key=lambda r: r.get("composite_score") or 0.0, reverse=True)
+    for r in adds[cap:]:
+        r["action"] = "WATCH_BUY"
+        r["rationale"] = (r.get("rationale") or "") + \
+            f" | 横截面闸门: 当日 composite 排名 {adds.index(r)+1}, 超出单日 ADD 上限 {cap}"
+        r["conviction"] = min(r.get("conviction", 0), 2)
+    return scored
+
+
 def _technical_score(signals_dict: dict) -> tuple[float, list[str]]:
     """Score from existing signal codes. -1 (sell) ~ +1 (buy)."""
     score = 0.0
@@ -573,27 +660,28 @@ def score(symbol: str, signals_dict: dict, fundamentals_data: dict | None = None
             "contribution": round(s * w, 3),
         }
 
-    # Translate composite to action — 阈值降 (从 0.40/0.15 → 0.30/0.10)
+    # Translate composite to action — 阈值见模块头部 ADD_THRESHOLD 的注释 (C9)
+    _t = action_thresholds()
     if catalyst_imminent:
         action = "DEFER_TO_LLM"
         rationale = "临近 catalyst (财报/FOMC), 单维度信号不可靠, 交 LLM 综合判断"
-    elif composite >= 0.30:
+    elif composite >= _t["add"]:
         action = "ADD"
         rationale = "多因子综合看多"
-    elif composite >= 0.10:
+    elif composite >= _t["watch_buy"]:
         action = "WATCH_BUY"
         rationale = "多因子综合偏多 (置信度中等)"
-    elif composite <= -0.30:
+    elif composite <= _t["reduce"]:
         action = "REDUCE"
         rationale = "多因子综合看空"
-    elif composite <= -0.10:
+    elif composite <= _t["watch_skip"]:
         action = "WATCH_SKIP"
         rationale = "多因子综合偏空"
     else:
         action = "HOLD"
         rationale = "多因子综合中性"
 
-    conviction = min(5, max(0, round(abs(composite) * 5)))
+    conviction = conviction_from_composite(composite, thresholds=_t)
 
     # Top / counter factors by absolute contribution.
     aligned_sign = 1 if composite >= 0 else -1

@@ -26,6 +26,15 @@ from .. import db, config as cfg_mod, fetcher
 log = logging.getLogger(__name__)
 
 SOURCE_PREFIX = "em_cn"
+NOTICE_SOURCE_PREFIX = "em_notice"
+
+# A6 (2026-09-10): 只有 stock_news_em 时, 002624 近 60 天只拿到 57 条 —— 相对
+# 美股持仓 (SEC form4/8-K + 5 个半导体专业源) 严重不足。公司公告是 A 股信息密度
+# 最高的来源 (业绩预告 / 重大合同 / 股权变动 / 停复牌), 且是法定披露, 噪音低。
+NOTICE_TYPES_HIGH_VALUE = {
+    "业绩预告", "业绩报告", "重大事项", "资产重组", "股份回购",
+    "增持减持", "股权变动", "融资公告", "风险提示", "停牌复牌",
+}
 
 
 def _is_a_share(symbol: str) -> bool:
@@ -70,7 +79,8 @@ def fetch_for_symbol(symbol: str, *, display_name: str | None = None) -> dict:
                     "INSERT INTO news_archive(url, title, source, published_at, "
                     "                         content, raw_hash, fetched_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (url, tagged_title, full_source, pub, content, raw_hash,
+                    (url, tagged_title, full_source,
+                     db.normalize_timestamp(pub), content, raw_hash,   # A2
                      datetime.utcnow().isoformat() + "Z"),
                 )
                 inserted += 1
@@ -79,6 +89,64 @@ def fetch_for_symbol(symbol: str, *, display_name: str | None = None) -> dict:
         c.commit()
 
     return {"symbol": symbol, "fetched": fetched, "inserted": inserted}
+
+
+def fetch_notices_for_symbols(symbols: dict[str, str], *, days_back: int = 3) -> dict:
+    """拉取 A 股公司公告 (东财) 并入 news_archive。
+
+    akshare 的 stock_notice_report 是按"日期 + 全市场"取的 (一天约 1,000 条),
+    所以这里一次拉全市场再按持仓代码过滤 —— 比逐个标的调用省得多。
+    """
+    if not symbols:
+        return {"fetched": 0, "inserted": 0, "matched": 0}
+    import datetime as _dt
+    codes = {s.split(".")[0]: nm for s, nm in symbols.items()}
+    fetched = inserted = matched = 0
+    try:
+        import akshare as ak
+    except Exception as e:  # noqa: BLE001
+        return {"fetched": 0, "inserted": 0, "matched": 0, "error": repr(e)[:200]}
+
+    for back in range(days_back):
+        day = (_dt.date.today() - _dt.timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            df = ak.stock_notice_report(symbol="全部", date=day)
+        except Exception as e:  # noqa: BLE001
+            log.warning("stock_notice_report(%s) failed: %s", day, e)
+            continue
+        if df is None or df.empty:
+            continue
+        fetched += len(df)
+        with db.conn() as c:
+            for _, row in df.iterrows():
+                code = str(row.get("代码", "") or "").strip()
+                if code not in codes:
+                    continue
+                matched += 1
+                title = str(row.get("公告标题", "") or "").strip()
+                ntype = str(row.get("公告类型", "") or "").strip()
+                url = str(row.get("网址", "") or "").strip()
+                pub = str(row.get("公告日期", "") or "").strip()
+                if not title or not url:
+                    continue
+                tagged = f"[{codes[code]} {code} 公告/{ntype}] {title}"
+                raw_hash = hashlib.sha256((tagged + url).encode()).hexdigest()[:16]
+                try:
+                    c.execute(
+                        "INSERT INTO news_archive(url, title, source, published_at, "
+                        "                         content, raw_hash, fetched_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (url, tagged, f"{NOTICE_SOURCE_PREFIX}_{code}",
+                         db.normalize_timestamp(pub),          # A2
+                         f"{ntype}: {title}", raw_hash,
+                         datetime.utcnow().isoformat() + "Z"),
+                    )
+                    inserted += 1
+                except sqlite3.IntegrityError:
+                    pass
+            c.commit()
+        time.sleep(1.0)
+    return {"fetched": fetched, "inserted": inserted, "matched": matched}
 
 
 def run_all(*, dry_run: bool = False) -> dict:
@@ -103,10 +171,14 @@ def run_all(*, dry_run: bool = False) -> dict:
         total_inserted += r.get("inserted", 0)
         time.sleep(1.0)  # gentle pacing
 
+    # A6: 个股新闻之外再拉公司公告 (法定披露, 信息密度高、噪音低)
+    notices = {"skipped": True} if dry_run else fetch_notices_for_symbols(dict(targets))
+
     return {
         "n_targets": len(targets),
         "total_fetched": total_fetched,
         "total_inserted": total_inserted,
+        "notices": notices,
         "by_symbol": by_symbol,
         "ts": datetime.now(timezone.utc).isoformat(),
     }

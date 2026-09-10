@@ -98,7 +98,7 @@ def _store_as_news(symbol: str, items: list[dict], form_type: str, source_label:
                     """INSERT INTO news_archive(url, title, source, published_at, content, raw_hash, fetched_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (it["url"], title, source_label,
-                     it.get("filed_at"),
+                     db.normalize_timestamp(it.get("filed_at")),   # A2
                      f"{form_type} filing for {symbol}", "",
                      datetime.utcnow().isoformat() + "Z"),
                 )

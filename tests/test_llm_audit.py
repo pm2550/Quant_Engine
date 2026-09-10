@@ -87,6 +87,12 @@ def test_estimate_cost_known_backend_returns_zero_for_free_tier():
     """
     from quant import llm_router as r
     r.reload_config()
-    assert r._estimate_cost("dashscope:qwen3.6-plus", 100_000, 50_000) == 0.0
+    # B1 (2026-09-10): 原来测的是 dashscope:qwen3.6-plus —— 该 provider 随 qwen
+    # coding plan 于 2026-06-01 到期下线, costs 表里已注释掉, 所以返回 None 而非 0.0。
+    # 改测当前真正在用的 backend。
+    assert r._estimate_cost("ollama:glm-5.1", 100_000, 50_000) == 0.0
+    assert r._estimate_cost("ollama:kimi-k2.6", 100_000, 50_000) == 0.0
+    # 下线的 provider 不在 costs 表里 → None (而不是谎报 0)
+    assert r._estimate_cost("dashscope:qwen3.6-plus", 100_000, 50_000) is None
     assert r._estimate_cost("ollama:kimi-k2-thinking", 1_000_000, 1_000_000) == 0.0
     assert r._estimate_cost("ollama:glm-5.1", 1_000_000, 1_000_000) == 0.0

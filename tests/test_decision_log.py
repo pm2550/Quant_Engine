@@ -58,14 +58,28 @@ def test_log_decision_writes_row(temp_db):
     assert row[3] == "ADD"  # action
 
 
-def test_log_decision_skips_hold(temp_db):
-    """HOLD 不入库 (review 时没意义)."""
+def test_log_decision_records_hold(temp_db):
+    """D6 (2026-09-10): HOLD 现在入库。
+
+    原行为是跳过 HOLD, 结果 4 个月 392 条决策只覆盖 6 只 watchlist 标的, 11 只实际
+    持仓一条都没有。而 "继续持有" 本身是决策; 更要紧的是没有 HOLD 就没有横截面,
+    而 composite 唯一被证实有效的恰好是横截面排序 (rank IC +0.44)。
+    """
     rid = decision_log.log_decision(
         symbol="AMD", action="HOLD", composite_score=0.05, conviction=0,
         entry_price=100.0, currency="USD",
         top_factors=[], counter_factors=[],
     )
-    assert rid is None
+    assert rid is not None
+
+
+def test_log_decision_rejects_unknown_action(temp_db):
+    """未知 action 仍然拒绝 —— 防止打错字悄悄入库。"""
+    assert decision_log.log_decision(
+        symbol="AMD", action="FROLIC", composite_score=0.05, conviction=0,
+        entry_price=100.0, currency="USD",
+        top_factors=[], counter_factors=[],
+    ) is None
 
 
 def test_log_decision_review_due_30_days(temp_db):
@@ -84,7 +98,7 @@ def test_log_decision_review_due_30_days(temp_db):
 
 # ---- log_from_raw bulk ----
 
-def test_log_from_raw_filters_hold(temp_db):
+def test_log_from_raw_includes_hold(temp_db):
     raw = {
         "recommendations": [
             {"symbol": "AMD", "action": "ADD", "currency": "USD", "notes": {"price": 200}},
@@ -100,8 +114,11 @@ def test_log_from_raw_filters_hold(temp_db):
         "signals": {},
     }
     counts = decision_log.log_from_raw(raw)
-    # AMD ADD + TSLA WATCH_SKIP + 002624 ADD = 3 logged; VOO HOLD skipped
-    assert counts == {"logged": 3, "skipped": 1}
+    # D6: HOLD 也记 → 4 条全入库, 0 跳过
+    assert counts == {"logged": 4, "skipped": 0}
+    with sqlite3.connect(temp_db) as conn:
+        actions = {r[0] for r in conn.execute("SELECT action FROM decision_log")}
+    assert "HOLD" in actions
 
 
 # ---- pending_reviews ----
@@ -150,12 +167,19 @@ def test_run_review_marks_was_correct(monkeypatch, temp_db):
             ((now - timedelta(days=35)).isoformat(), (now - timedelta(days=5)).isoformat()),
         )
 
-    # Mock fetcher.load_local
+    # D7 (2026-09-10): 复盘改成按 review_due_at 当天取价, 不再用"最新收盘价"。
+    # 所以 mock 必须带真实日期索引 —— 原 mock 是无索引的单行 DataFrame, 在旧实现下
+    # 靠 .iloc[-1] 蒙对, 也正因此掩盖了"月度 timer 让 30 天 horizon 变成 31~61 天
+    # 不定"这个问题。
+    def _series(price: float) -> pd.DataFrame:
+        idx = pd.date_range(now - timedelta(days=40), now, freq="D")
+        return pd.DataFrame({"close": [price] * len(idx)}, index=idx)
+
     def fake_load(sym):
         if sym == "AMD":
-            return pd.DataFrame({"close": [120.0]})
+            return _series(120.0)
         if sym == "TSLA":
-            return pd.DataFrame({"close": [98.0]})
+            return _series(98.0)
         return pd.DataFrame()
     monkeypatch.setattr(decision_review.fetcher, "load_local", fake_load)
 
@@ -163,7 +187,9 @@ def test_run_review_marks_was_correct(monkeypatch, temp_db):
     assert out["reviewed"] == 2
     assert out["by_action"]["ADD"]["hit_rate"] == 1.0
     assert out["by_action"]["ADD"]["avg_return_pct"] == 20.0
-    assert out["by_action"]["WATCH_SKIP"]["hit_rate"] == 1.0
+    # D5: WATCH_SKIP 不再判对错 → hit_rate 为 None, 但收益仍然统计
+    assert out["by_action"]["WATCH_SKIP"]["hit_rate"] is None
+    assert out["by_action"]["WATCH_SKIP"]["avg_return_pct"] == -2.0
 
 
 def test_run_review_records_worst_miss(monkeypatch, temp_db):
@@ -176,8 +202,9 @@ def test_run_review_records_worst_miss(monkeypatch, temp_db):
             ((now - timedelta(days=35)).isoformat(), (now - timedelta(days=5)).isoformat()),
         )
 
+    idx = pd.date_range(now - timedelta(days=40), now, freq="D")
     monkeypatch.setattr(decision_review.fetcher, "load_local",
-                        lambda s: pd.DataFrame({"close": [70.0]}))
+                        lambda s: pd.DataFrame({"close": [70.0] * len(idx)}, index=idx))
     out = decision_review.run_review(dry_run=True, push=False)
     assert out["worst_miss"]["symbol"] == "X"
     assert out["worst_miss"]["actual_return_pct"] == -30.0
@@ -206,7 +233,44 @@ def test_was_correct_defer_returns_none():
     assert decision_review._was_correct(expected=0, return_pct=15) is None
 
 
-def test_was_correct_watch_skip_small_move_still_correct():
-    """WATCH_SKIP +3% 不算大踏空."""
-    assert decision_review._was_correct(expected=-1, return_pct=3.0) == 1
-    assert decision_review._was_correct(expected=-1, return_pct=10.0) == 0
+def test_was_correct_watch_skip_not_scored():
+    """D5 (2026-09-10): WATCH_SKIP 不再判对错。
+
+    旧定义是 "30 天后涨幅 <5% 算对" —— 牛市里恒为真。月度复盘因此报 55% 命中,
+    而同期 conviction=1 (即 "偏空别买") 那组实际平均涨了 +16.31%, 最大踏空
+    PLTR +52.45%。指标在自我恭喜。观望类动作的质量改用 rank IC 衡量
+    (quant.calibration.calibrate_ranking)。
+    """
+    assert decision_review._was_correct(-1, 3.0, "WATCH_SKIP") is None
+    assert decision_review._was_correct(-1, 50.0, "WATCH_SKIP") is None
+    # 没传 action 时保持旧的纯方向语义 (向后兼容调用方)
+    assert decision_review._was_correct(expected=-1, return_pct=-5.0) == 1
+
+
+def test_was_correct_no_grace_band_for_directional():
+    """REDUCE 之后涨 4% 必须算错 —— 旧逻辑的 5% 宽容带已废除。"""
+    assert decision_review._was_correct(-1, 4.0, "REDUCE") == 0
+
+
+def test_review_uses_due_date_price_not_latest(monkeypatch, temp_db):
+    """D7 (2026-09-10): 必须按 review_due_at 当天取价, 而不是最新收盘价。
+
+    复盘是月度 timer 跑的, 所以 8 月 1 日的决策原本是在 9 月 1 日按 9 月 1 日价格
+    评分 —— 名义 30 天 horizon 实际变成 31~61 天不定, 不同决策之间不可比。
+    """
+    now = datetime.utcnow()
+    due = now - timedelta(days=5)
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute(
+            "INSERT INTO decision_log (decided_at, symbol, action, entry_price, "
+            "conviction, review_due_at) VALUES (?, 'AMD', 'ADD', 100.0, 3, ?)",
+            ((now - timedelta(days=35)).isoformat(), due.isoformat()),
+        )
+    # 构造: 到期日价 110 (+10%), 之后暴涨到 200 (+100%)。用最新价会得出 +100%。
+    idx = pd.date_range(now - timedelta(days=40), now, freq="D")
+    closes = [110.0 if d <= due else 200.0 for d in idx]
+    monkeypatch.setattr(decision_review.fetcher, "load_local",
+                        lambda s: pd.DataFrame({"close": closes}, index=idx))
+    out = decision_review.run_review(dry_run=True, push=False)
+    assert out["by_action"]["ADD"]["avg_return_pct"] == 10.0, \
+        "用了最新价而非到期日价格 (应为 +10%, 不是 +100%)"

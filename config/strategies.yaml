@@ -48,3 +48,18 @@ action_rules:
   take_profit:
     pnl_pct: 0.30
     or_rsi_above: 80
+
+# ---- multi_factor 动作阈值 (C9, 2026-09-10) ----
+# 改这里即可调参, 不用动代码。改完请跑:
+#   ./venv/bin/python -m quant.calibration        # 看 composite 的实际预测力
+#   ./venv/bin/python -m quant.threshold_report   # 看新阈值在历史上的触发情况
+multi_factor:
+  # 原 0.30 —— 4 个月仅触发 3 次。threshold_report 的 min-of-segments 口径给出 0.10
+  # (各段价差 6.61/14.19), 0.12 是 6.52/21.46 —— 在 ~40 个重叠样本上两者差异属噪音。
+  # 取更保守的 0.12: 这是一个会真的开始发买入建议的开关, 宁可少发。
+  # 攒满一个季度后重跑 `python -m quant.threshold_report --split <date>` 再定。
+  add_threshold: 0.12
+  watch_buy_threshold: 0.06
+  reduce_threshold: -0.12
+  watch_skip_threshold: -0.06
+  max_adds_per_day: 3          # 横截面闸门: 同日 ADD 上限 (截面 IC 有效, 时序 IC ≈0)
