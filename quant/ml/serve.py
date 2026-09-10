@@ -153,6 +153,39 @@ def get_predictions(symbols: list[str] | None = None,
     return preds or {}, status
 
 
+def live_performance_line(*, model: str = "challenger_lgbm",
+                           horizon_days: int = 20) -> str:
+    """从 model_calibration 读**实测**表现, 绝不写死数字。
+
+    踩过的坑 (2026-09-10): 这里原本是一行字符串字面量
+        "OOS: IC +0.049 / RankIC +0.040 / TopDecile Spread +3.5%/20d"
+    那组数字出自 results/challenger_v4_funds.json —— 2026-05-27 06:34 的一次离线实验。
+    模型每周由 quant-challenger-retrain.timer 重训, 特征、宇宙、数据全换过几轮,
+    这行数字 3.5 个月从没重算, 却一直印在每天的日报上。而同期实测逐日截面 rank IC
+    是 −0.216。写死的性能指标 = 一个永远不会报错的谎。
+    """
+    try:
+        from quant import db
+        with db.conn() as c:
+            row = c.execute(
+                """SELECT computed_at, n_samples, daily_rank_ic, ic_positive_day_pct
+                   FROM model_calibration
+                   WHERE model = ? AND horizon_days = ?
+                   ORDER BY computed_at DESC LIMIT 1""",
+                (model, horizon_days)).fetchone()
+    except Exception as e:  # noqa: BLE001
+        log.warning("读取 model_calibration 失败: %s", e)
+        return "实测表现: 读取失败 — 见 /api/calibration"
+    if not row or row["daily_rank_ic"] is None:
+        return "实测表现: 尚无校准记录 (跑 `python -m quant.calibration`)"
+    ic = float(row["daily_rank_ic"])
+    pos = row["ic_positive_day_pct"]
+    flag = "⚠️ 方向为负, 不要据此下单" if ic < 0 else "✅"
+    pos_s = f", IC 为正日占比 {float(pos):.0f}%" if pos is not None else ""
+    return (f"实测逐日截面 rank IC {ic:+.3f}{pos_s} "
+            f"(n={row['n_samples']}, 截至 {row['computed_at']}) {flag}")
+
+
 def render_section(preds: dict, *,
                     composite_actions: dict[str, str] | None = None,
                     held_symbols: list[str] | None = None,
@@ -175,9 +208,9 @@ def render_section(preds: dict, *,
     preds_list = [v.get("pred_forward_return", 0.0) for v in preds.values()]
     n_neg = sum(1 for p in preds_list if p < 0)
     lines = [
-        "📊 *LightGBM Challenger* (Alpha158+macro+EDGAR, 161 特征) — **仅供排序, 非收益预测**",
+        "📊 *LightGBM Challenger* (Alpha158+macro+EDGAR) — **仅供排序, 非收益预测**",
         f"as_of: {as_of}, horizon {horizon}d; freshness: {freshness}",
-        f"⚠️ 实测逐日截面 rank IC 为负, 不要据此下单; 校准实绩见 /api/calibration",
+        live_performance_line(),
         f"_本批 {len(preds_list)} 只中 {n_neg} 只为负 —— 模型存在正向水平偏移_",
     ]
 

@@ -539,3 +539,44 @@ class TestBilibiliClickOrderDegradation:
                                 metric_date=date.today().isoformat())
         sigs = {f["signal"] for f in anomaly.check_keyword("K", dry_run=True)}
         assert "plays_drop" not in sigs, "降级抓取触发了假告警"
+
+
+# ---------------------------------------------------------------- C5b / C6b
+class TestChallengerTrainingGuards:
+    """2026-09-10 追查 challenger 负 IC 时发现的两个训练/展示缺陷。"""
+
+    def test_val_coverage_threshold_exists(self):
+        """train_full 的 val_cutoff = dates[-60] 取的是**池化**日期并集, 只要求
+        "至少有一只标的还在更新"。143/159 只价格冻结时, 验证集只剩约 20 只
+        (1,798 行) 而训练集是 156 只 (525,259 行) —— 早停在错的分布上决定。
+        """
+        import sys
+        sys.path.insert(0, "/data2/quant")
+        from quant.ml import challenger
+        assert hasattr(challenger, "MIN_VAL_SYMBOL_COVERAGE")
+        assert 0.5 <= challenger.MIN_VAL_SYMBOL_COVERAGE <= 0.95
+
+    def test_performance_line_reads_live_data(self):
+        """原来是字符串字面量 "OOS: IC +0.049 ..." —— 出自 2026-05-27 的一次离线
+        实验, 模型每周重训而这行数字 3.5 个月从没重算, 却天天印在日报上。
+        """
+        from quant.ml import serve
+        # 检查渲染输出, 不是源码 —— 源码的 docstring 里会引用那个旧字符串做说明
+        rendered = serve.render_section(
+            {"AMD": {"pred_forward_return": 0.03, "horizon_days": 20,
+                      "as_of": date.today().isoformat()}},
+            held_symbols=["AMD"], freshness="fresh")
+        assert "+0.049" not in rendered, "写死的性能指标又回到输出里了"
+        line = serve.live_performance_line()
+        assert isinstance(line, str) and line
+        # 必须带上样本量或明确说没数据, 不能是一个无出处的数字
+        assert ("n=" in line) or ("尚无" in line) or ("失败" in line)
+
+    def test_performance_line_survives_missing_table(self, tmp_path, monkeypatch):
+        """校准表为空时给出提示而不是崩 / 不是编一个数字。"""
+        from quant import db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "empty.sqlite")
+        db.init()
+        from quant.ml import serve
+        line = serve.live_performance_line()
+        assert "尚无校准记录" in line or "失败" in line
