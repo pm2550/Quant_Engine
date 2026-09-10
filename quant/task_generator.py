@@ -155,10 +155,17 @@ def _month_ends_back(n: int) -> list[str]:
 
 
 def walk_forward(*, n_months: int = 18, periods: list[int] | None = None) -> int:
-    """For each (strategy, params, symbol), re-run with as_of set to past N month-ends."""
+    """For each (strategy, params, symbol), re-run with as_of set to past N month-ends.
+
+    2026-09-10: 这里原来也是 cfg.all_symbols(portfolio) = 16 只。seed() 扩到全宇宙后
+    如果这里不跟上, 普通任务跑完 (约 2 小时) 队列又会空 —— walk-forward 才是任务量的
+    主体 (历史上 120,153 条里有 102,204 条是 walk-forward 变体)。
+    持仓/关注仍然优先: priority = -1 (普通任务之后) vs -2 (其余宇宙最后)。
+    """
     db.init()
     portfolio = cfg_mod.load("portfolio")
-    symbols = cfg_mod.all_symbols(portfolio)
+    held = set(cfg_mod.all_symbols(portfolio))
+    symbols = seed_universe()
     periods = periods or [3, 5]
     viable = _viable_symbols_for_period(symbols)
     month_ends = _month_ends_back(n_months)
@@ -168,6 +175,7 @@ def walk_forward(*, n_months: int = 18, periods: list[int] | None = None) -> int
         for params in grid_fn():
             for symbol in symbols:
                 max_years = viable.get(symbol, 0)
+                wf_prio = -1 if symbol in held else -2
                 for years in periods:
                     if years > max_years:
                         n_skipped += 1
@@ -175,10 +183,11 @@ def walk_forward(*, n_months: int = 18, periods: list[int] | None = None) -> int
                     for as_of in month_ends:
                         wf_params = dict(params, as_of=as_of)
                         new_id = db.enqueue(strategy, symbol, wf_params,
-                                            period_years=years, priority=-1)
+                                            period_years=years, priority=wf_prio)
                         if new_id is not None:
                             n_added += 1
-    log.info("walk-forward: seeded %d tasks (skipped %d)", n_added, n_skipped)
+    log.info("walk-forward: seeded %d tasks over %d symbols (skipped %d)",
+             n_added, len(symbols), n_skipped)
     return n_added
 
 

@@ -762,3 +762,18 @@ class TestQuarantineRegistry:
     def test_unquarantine_is_noop_for_unknown(self):
         from quant import price_refresh as P
         assert P.unquarantine("__NOT_A_REAL_SYMBOL__") is False
+
+    def test_walk_forward_uses_same_universe(self):
+        """G3b: walk_forward 是任务量的主体 (历史 120,153 条里 111,222 条是它)。
+        如果只扩 seed() 而漏了这里, 普通任务跑完 (约 2 小时) 队列就又空了。
+        """
+        from quant import task_generator as T
+        import inspect
+        src = inspect.getsource(T.walk_forward)
+        assert "seed_universe()" in src, "walk_forward 还在用旧的 portfolio-only 宇宙"
+        assert "cfg_mod.all_symbols(portfolio)\n    periods" not in src
+
+    def test_walk_forward_keeps_portfolio_priority(self):
+        from quant import task_generator as T
+        import inspect
+        assert "wf_prio" in inspect.getsource(T.walk_forward)
