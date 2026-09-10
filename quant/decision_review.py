@@ -213,10 +213,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-push", action="store_true", help="run review but don't send TG")
+    ap.add_argument("--score-only", action="store_true",
+                     help="只回填 actual_return_pct, 不推 TG 摘要 (给每日 timer 用)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    out = run_review(dry_run=args.dry_run, push=not args.no_push)
+    # 2026-09-10: 打分与推送拆开。复盘原来只有月度 timer, 所以 9 月 10 日到期的决策
+    # 要等到 10 月 1 日才被打分 —— 反馈延迟 21 天, 而且 quant.calibration 在那之前
+    # 看不到这批数据。现在每天打分 (只查到期日价格, 很便宜), 每月推摘要。
+    push = not (args.no_push or args.score_only)
+    out = run_review(dry_run=args.dry_run, push=push)
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 

@@ -63,3 +63,9 @@ multi_factor:
   reduce_threshold: -0.12
   watch_skip_threshold: -0.06
   max_adds_per_day: 3          # 横截面闸门: 同日 ADD 上限 (截面 IC 有效, 时序 IC ≈0)
+
+# ---- 回测宇宙 (2026-09-10) ----
+# portfolio = 只回测持仓+关注 (16 只, 旧行为 —— 网格已于 2026-09-01 穷举完, daemon 空转)
+# full      = 全部有本地价格的标的 (157 只)
+backtest:
+  universe_mode: full

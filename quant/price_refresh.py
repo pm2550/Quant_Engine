@@ -24,6 +24,7 @@ A1 (2026-09-10) 的根因:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from datetime import date, datetime, timedelta
@@ -38,6 +39,7 @@ log = logging.getLogger(__name__)
 
 PRICES_DIR = Path("/data2/quant/data/prices")
 DELISTED_DIR = PRICES_DIR / "_delisted"
+QUARANTINE_REGISTRY = DELISTED_DIR / "QUARANTINE.json"
 QUARANTINE_AFTER_DAYS = 45   # 连续这么久都拉不到新 bar, 视为退市/改名
 SLEEP_BETWEEN = 0.35        # yfinance 礼貌间隔
 STALE_AFTER_DAYS = 2        # 周末/假日不算陈旧, 所以给 2 天余量
@@ -45,6 +47,36 @@ STALE_AFTER_DAYS = 2        # 周末/假日不算陈旧, 所以给 2 天余量
 
 def cached_symbols() -> list[str]:
     return sorted(p.stem for p in PRICES_DIR.glob("*.parquet"))
+
+
+def quarantined_symbols() -> dict[str, dict]:
+    """已隔离标的登记表 {symbol: {last_bar, quarantined_at, reason}}。
+
+    2026-09-10: 光把 parquet 移进 _delisted/ 不够 —— universe_symbols() 会从
+    dynamic_universe.yaml 把它读回来, refresh() 再从 yfinance 拉一份**退市前的**
+    历史 (delisted 标的的历史数据仍然可下载), parquet 就复活了, 下次 quarantine
+    再移走…… 两个组件互相打架, 无限循环。实测踩到: APGE 被隔离后 3 分钟就复活。
+    所以隔离必须是持久化登记, 而不只是移动文件。
+    """
+    try:
+        return json.loads(QUARANTINE_REGISTRY.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def unquarantine(symbol: str) -> bool:
+    """手动放行 (标的重新上市 / 误判)。返回是否真的移除了登记。"""
+    reg = quarantined_symbols()
+    if symbol not in reg:
+        return False
+    reg.pop(symbol)
+    QUARANTINE_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    QUARANTINE_REGISTRY.write_text(json.dumps(reg, ensure_ascii=False, indent=2))
+    src = DELISTED_DIR / f"{symbol}.parquet"
+    if src.exists():
+        src.rename(PRICES_DIR / src.name)
+    log.info("解除隔离: %s", symbol)
+    return True
 
 
 def universe_symbols() -> list[str]:
@@ -65,6 +97,12 @@ def universe_symbols() -> list[str]:
                 syms |= {x for x in v if isinstance(x, str)}
             elif isinstance(v, dict):
                 syms |= {k for k in v if isinstance(k, str)}
+    banned = set(quarantined_symbols())
+    if banned:
+        dropped = syms & banned
+        if dropped:
+            log.info("跳过 %d 个已隔离标的: %s", len(dropped), sorted(dropped)[:10])
+        syms -= banned
     return sorted(s for s in syms if s and not s.startswith("_"))
 
 
@@ -168,7 +206,20 @@ def quarantine_delisted(*, after_days: int = QUARANTINE_AFTER_DAYS,
         except Exception as e:  # noqa: BLE001
             kept.append(s_)
             log.warning("隔离 %s 失败: %s", s_, e)
-    return {"quarantined": moved, "failed": kept, "dry_run": dry_run}
+
+    if moved and not dry_run:
+        # 写持久化登记, 否则下次 refresh 会把它们从配置里读回来重新下载
+        reg = quarantined_symbols()
+        now = datetime.utcnow().isoformat()
+        for sym, last in moved:
+            reg[sym] = {"last_bar": last, "quarantined_at": now,
+                         "reason": f">{after_days} 天无新数据 (疑似退市/改名)"}
+        QUARANTINE_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        QUARANTINE_REGISTRY.write_text(json.dumps(reg, ensure_ascii=False, indent=2))
+        log.warning("隔离登记已更新, 共 %d 个标的; 误判可用 "
+                     "`python -m quant.price_refresh --unquarantine SYM` 放行", len(reg))
+    return {"quarantined": moved, "failed": kept, "dry_run": dry_run,
+            "registry_size": len(quarantined_symbols())}
 
 
 def main() -> None:
@@ -179,18 +230,24 @@ def main() -> None:
     ap.add_argument("--quarantine", action="store_true",
                      help="把 >45 天没新数据的标的移到 _delisted/")
     ap.add_argument("--dry-run", action="store_true", help="配合 --quarantine 只看不动")
+    ap.add_argument("--unquarantine", metavar="SYM", help="解除某标的的隔离 (重新上市/误判)")
+    ap.add_argument("--list-quarantined", action="store_true", help="列出已隔离标的")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if a.report:
-        import json
         print(json.dumps(staleness_report(), ensure_ascii=False, indent=2))
         return
+    if a.list_quarantined:
+        print(json.dumps(quarantined_symbols(), ensure_ascii=False, indent=2))
+        return
+    if a.unquarantine:
+        ok = unquarantine(a.unquarantine.upper())
+        print(f"{a.unquarantine}: {'已解除隔离' if ok else '不在隔离名单中'}")
+        return
     if a.quarantine:
-        import json
         print(json.dumps(quarantine_delisted(dry_run=a.dry_run),
                          ensure_ascii=False, indent=2))
         return
-    import json
     print(json.dumps(refresh(stale_only=a.stale_only, max_symbols=a.max),
                      ensure_ascii=False, indent=2))
 

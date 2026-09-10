@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily decision scoring (fill actual_return_pct at due date; monthly timer still pushes the digest)
+Documentation=file:///data2/quant/docs/AUDIT-20260910.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data2/quant
+EnvironmentFile=/data2/quant/secrets/secrets.env
+ExecStart=/data2/quant/venv/bin/python -m quant.decision_review --score-only
+StandardOutput=append:/data2/quant/logs/decision_score.log
+StandardError=append:/data2/quant/logs/decision_score.err
+TimeoutStartSec=600

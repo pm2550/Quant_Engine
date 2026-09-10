@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily decision scoring (03:00 UTC — 在 calibration 03:30 之前, 让校准能看到当天新打分的数据)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

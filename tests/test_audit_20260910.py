@@ -622,3 +622,143 @@ class TestAudioPromptRendering:
         from quant import audio_queue_worker as W
         with pytest.raises((KeyError, IndexError, ValueError)):
             W.ANALYZE_PROMPT.format(portfolio="X", source="s", title="t")
+
+
+# ---------------------------------------------------------------- G2
+class TestThinkingLeakGuard:
+    """G2 (验证周报时发现): "一周总结" 输出的是模型的思考过程而不是总结。
+
+    weekly_report 的注释写着 "simple_chat (qwen, non-thinking)" —— 那个假设在
+    2026-06-01 dashscope 下线时就失效了, simple_chat 现在路由到 ollama:kimi-k2.6,
+    是个 thinking 模型。max_tokens=400 全烧在思考上 → content 为空 → llm_router
+    的抢救逻辑把 thinking 当答案交出来。又是一个配置变更让代码注释的假设静默失效。
+    """
+
+    def test_chat_accepts_salvage_opt_out(self):
+        from quant import llm_router as R
+        import inspect
+        assert "allow_thinking_salvage" in inspect.signature(R.chat).parameters
+
+    def test_weekly_disables_thinking_and_salvage(self):
+        from quant import weekly_report
+        import inspect
+        src = inspect.getsource(weekly_report.llm_summarize)
+        assert "disable_thinking=True" in src
+        assert "allow_thinking_salvage=False" in src
+
+    def test_weekly_discards_leaked_thinking(self, monkeypatch):
+        """即使前两道防线都失守, 泄漏特征文本也必须被丢弃而不是展示给主人。"""
+        from quant import weekly_report
+        leaked = "用户要求根据提供的数据，用中文写80-150字总结...\n分析数据：\n1. 组合收益"
+        monkeypatch.setattr(weekly_report.llm_router, "chat",
+                            lambda *a, **k: {"text": leaked})
+        assert weekly_report.llm_summarize({"pnl": {}}) == ""
+
+    def test_weekly_keeps_real_summary(self, monkeypatch):
+        from quant import weekly_report
+        good = "本周组合呈现美元资产强势、人民币资产拖累的分化格局。建议关注 VRT 放量暴跌。"
+        monkeypatch.setattr(weekly_report.llm_router, "chat",
+                            lambda *a, **k: {"text": good})
+        assert weekly_report.llm_summarize({"pnl": {}}) == good
+
+    def test_chat_json_still_forces_no_thinking(self):
+        """newswatch 等走 chat_json 的调用点靠这个默认值保护, 不能被改掉。"""
+        from quant import llm_router as R
+        import inspect
+        assert 'setdefault("disable_thinking", True)' in inspect.getsource(R.chat_json)
+
+
+# ---------------------------------------------------------------- D7b
+class TestDecisionScoringCadence:
+    """D7b: 复盘原来只有月度 timer, 9 月 10 日到期的决策要等 10 月 1 日才打分。"""
+
+    def test_score_only_flag_exists(self):
+        from quant import decision_review
+        import inspect
+        assert "--score-only" in inspect.getsource(decision_review.main)
+
+
+# ---------------------------------------------------------------- G3
+class TestBacktestUniverse:
+    """G3: 回测网格在 2026-09-01 对 16 只标的穷举完毕, daemon 此后空转 9 天。
+
+    后果不只是"没有新回测": 这台 OCI 免费实例靠回测服务撑 CPU 占用防回收
+    (连续 7 天 <20% 会被收回), 队列空 → CPU 掉到 ~6%。
+    A1 修好价格缓存后本地有 157 只标的的完整历史, 没理由只回测 16 只。
+    """
+
+    def test_universe_is_larger_than_portfolio(self):
+        from quant import task_generator as T
+        from quant import config as cfg_mod
+        held = set(cfg_mod.all_symbols(cfg_mod.load("portfolio")))
+        universe = T.seed_universe()
+        assert len(universe) > len(held) * 3, \
+            f"播种宇宙只有 {len(universe)} 只, 网格会很快再次穷举"
+
+    def test_portfolio_symbols_come_first(self):
+        """持仓/关注要排在前面并拿高优先级 —— 最有用的结果先跑出来。"""
+        from quant import task_generator as T
+        from quant import config as cfg_mod
+        held = set(cfg_mod.all_symbols(cfg_mod.load("portfolio")))
+        universe = T.seed_universe()
+        head = universe[:len(held)]
+        assert set(head) == held, "持仓标的没有排在播种列表最前面"
+
+    def test_priority_tiers_distinct(self):
+        from quant import task_generator as T
+        assert T.PORTFOLIO_PRIORITY > T.UNIVERSE_PRIORITY
+
+    def test_universe_mode_configurable(self):
+        """必须能一行配置退回旧行为 (万一磁盘/CPU 吃紧)。"""
+        from quant import config as cfg_mod
+        cfg = (cfg_mod.load("strategies") or {}).get("backtest") or {}
+        assert cfg.get("universe_mode") in ("full", "portfolio")
+
+    def test_delisted_not_in_universe(self):
+        """隔离目录 _delisted/ 里的标的不能被播种 (它们没有新数据了)。"""
+        from quant import task_generator as T
+        universe = set(T.seed_universe())
+        for dead in ("CELT", "APLS", "APGE"):
+            assert dead not in universe, f"已退市的 {dead} 又被播种了"
+
+
+# ---------------------------------------------------------------- G4
+class TestQuarantineRegistry:
+    """G4 (自己新代码打架): 光把 parquet 移进 _delisted/ 不够。
+
+    universe_symbols() 会从 dynamic_universe.yaml 把标的读回来, refresh() 再从
+    yfinance 拉一份**退市前的**历史 (delisted 标的历史仍可下载), parquet 就复活了,
+    下次 quarantine 再移走…… 实测: APGE 被隔离后 3 分钟就复活。
+    隔离必须是持久化登记, 不能只靠移动文件。
+    """
+
+    def test_registry_functions_exist(self):
+        from quant import price_refresh as P
+        assert callable(P.quarantined_symbols)
+        assert callable(P.unquarantine)
+
+    def test_quarantined_excluded_from_refresh_universe(self):
+        from quant import price_refresh as P
+        banned = set(P.quarantined_symbols())
+        if not banned:
+            pytest.skip("当前无隔离标的")
+        universe = set(P.universe_symbols())
+        assert not (banned & universe), \
+            f"已隔离标的仍在刷新宇宙里, 会被重新下载: {banned & universe}"
+
+    def test_quarantined_excluded_from_seed_universe(self):
+        from quant import price_refresh as P, task_generator as T
+        banned = set(P.quarantined_symbols())
+        if not banned:
+            pytest.skip("当前无隔离标的")
+        assert not (banned & set(T.seed_universe()))
+
+    def test_registry_entries_have_reason(self):
+        from quant import price_refresh as P
+        for sym, meta in P.quarantined_symbols().items():
+            assert meta.get("reason"), f"{sym} 的隔离登记没写原因"
+            assert meta.get("last_bar"), f"{sym} 的隔离登记没写最后数据日期"
+
+    def test_unquarantine_is_noop_for_unknown(self):
+        from quant import price_refresh as P
+        assert P.unquarantine("__NOT_A_REAL_SYMBOL__") is False

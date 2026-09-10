@@ -370,8 +370,16 @@ def chat(
     timeout: int = 120,
     response_format: str | None = None,
     disable_thinking: bool = False,
+    allow_thinking_salvage: bool = True,
 ) -> dict:
-    """LLM dispatch via config-driven route chain. Returns dict with text/backend/tokens."""
+    """LLM dispatch via config-driven route chain. Returns dict with text/backend/tokens.
+
+    allow_thinking_salvage (2026-09-10): 模型返回空 content 时, 默认会把它的 thinking
+    字段当答案交出去 —— 对内部用途 (总比什么都没有强) 可以, 但对**直接给主人看的散文**
+    是灾难: 周报的"一周总结"因此输出了一整段
+        "用户要求根据提供的数据，用中文写80-150字总结... 分析数据：1. 组合收益..."
+    也就是模型的思考过程被当成了总结。产出用户可见文字的调用点应传 False。
+    """
     if isinstance(prompt, str):
         messages = []
         if system:
@@ -425,6 +433,11 @@ def chat(
                 if not text.strip():
                     # Some thinking-mode models emit content="" when budget exhausted by thinking.
                     think = (out.get("thinking") or "").strip()
+                    if think and not allow_thinking_salvage:
+                        raise RuntimeError(
+                            f"{entry} 只返回了 thinking 没有 content; 调用方拒绝抢救 "
+                            f"(allow_thinking_salvage=False) —— 加大 max_tokens 或 "
+                            f"传 disable_thinking=True")
                     if think:
                         log.info("backend %s returned empty content, salvaging thinking field", entry)
                         out["text"] = think

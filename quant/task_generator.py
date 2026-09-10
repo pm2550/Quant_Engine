@@ -60,14 +60,53 @@ def _viable_symbols_for_period(symbols: list[str], min_rows_per_year: int = 200)
     return out
 
 
+# ---- 播种宇宙 (2026-09-10) --------------------------------------------------
+# 原来 seed() 只用 cfg.all_symbols(portfolio) = 16 只持仓+关注。它们的全部组合
+# (4 策略 × 参数网格 × 周期 [3,5,10]) 在 2026-09-01 就穷举完了, 之后 daemon 每
+# 600 秒醒一次、发现无事可做、再睡 —— 已经空转 9 天。两个后果:
+#   1. 不再产出任何新的回测知识
+#   2. CPU 掉到 ~6% (94% idle), 而这台 OCI 免费实例靠回测撑 CPU 占用防回收
+#      (阈值: 连续 7 天 <20%)
+# A1 修好价格缓存后, 本地有 157 只标的的完整历史, 没理由只回测其中 16 只。
+#
+# 优先级分层: 持仓/关注 = 10 (先跑完, 结果最有用), 其余宇宙 = 0 (慢慢填)。
+# 容量: 157 只约 118 万个任务 × ~300 字节 ≈ 354 MB; 按有活时日均 1.5 万的实测
+# 吞吐约 2.6 个月跑完 (峰值 7.9 万/天时约 2 周)。
+PORTFOLIO_PRIORITY = 10
+UNIVERSE_PRIORITY = 0
+
+
+def seed_universe() -> list[str]:
+    """回测宇宙 = 持仓/关注 + 本地有价格缓存的其余标的。
+
+    由 config/strategies.yaml 的 backtest.universe_mode 控制:
+      "portfolio" (旧行为) —— 只回测持仓+关注
+      "full"      (默认)   —— 全部有价格的标的
+    """
+    portfolio = cfg_mod.load("portfolio")
+    held = list(cfg_mod.all_symbols(portfolio))
+    try:
+        mode = ((cfg_mod.load("strategies") or {}).get("backtest") or {}).get(
+            "universe_mode", "full")
+    except Exception:  # noqa: BLE001
+        mode = "full"
+    if mode == "portfolio":
+        return held
+    from . import price_refresh
+    rest = [s for s in price_refresh.cached_symbols() if s not in set(held)]
+    return held + sorted(rest)
+
+
 def seed(periods: list[int] | None = None) -> int:
     """Push the full strategy×param×symbol grid into the queue.
 
     Only enqueues (symbol, period) combinations the symbol has enough history for.
+    持仓/关注标的用高优先级入队, 让最有用的结果先跑出来。
     """
     db.init()
     portfolio = cfg_mod.load("portfolio")
-    symbols = cfg_mod.all_symbols(portfolio)
+    held = set(cfg_mod.all_symbols(portfolio))
+    symbols = seed_universe()
     periods = periods or [3, 5, 10]
     viable = _viable_symbols_for_period(symbols)
 
@@ -76,14 +115,17 @@ def seed(periods: list[int] | None = None) -> int:
         for params in grid_fn():
             for symbol in symbols:
                 max_years = viable.get(symbol, 0)
+                prio = PORTFOLIO_PRIORITY if symbol in held else UNIVERSE_PRIORITY
                 for years in periods:
                     if years > max_years:
                         n_skipped += 1
                         continue
-                    new_id = db.enqueue(strategy, symbol, params, period_years=years, priority=0)
+                    new_id = db.enqueue(strategy, symbol, params,
+                                         period_years=years, priority=prio)
                     if new_id is not None:
                         n_added += 1
-    log.info("seeded %d new tasks (skipped %d for insufficient history)", n_added, n_skipped)
+    log.info("seeded %d new tasks over %d symbols (skipped %d for insufficient history)",
+             n_added, len(symbols), n_skipped)
     return n_added
 
 

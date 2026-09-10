@@ -199,9 +199,19 @@ def llm_summarize(report_data: dict) -> str:
 
 数据:
 {json.dumps(report_data, ensure_ascii=False, default=str)[:4000]}"""
-        # Use simple_chat (qwen, non-thinking) so we get clean output, not thinking traces
-        out = llm_router.chat(prompt, task="simple_chat", max_tokens=400, timeout=120)
-        return out["text"].strip()
+        # 2026-09-10: 这里原来的注释写着 "simple_chat (qwen, non-thinking)" —— 那个假设
+        # 在 2026-06-01 dashscope 下线时就失效了, simple_chat 现在路由到 ollama:kimi-k2.6,
+        # 是个 thinking 模型。max_tokens=400 全烧在思考上 → content 为空 → llm_router 的
+        # 抢救逻辑把 thinking 当答案交出来, 于是"一周总结"变成了一整段思考过程。
+        # 三重保险: 显式关 thinking + 加大预算 + 拒绝 thinking 抢救。
+        out = llm_router.chat(prompt, task="simple_chat", max_tokens=1200, timeout=180,
+                               disable_thinking=True, allow_thinking_salvage=False)
+        text = out["text"].strip()
+        # 兜底: 万一模型仍然复述指令 (thinking 泄漏的特征), 宁可不显示也不显示垃圾
+        if any(m in text[:80] for m in ("用户要求", "根据以下数据", "分析数据：", "首先，")):
+            log.warning("weekly LLM 总结疑似思考泄漏, 丢弃: %s", text[:80])
+            return ""
+        return text
     except Exception as e:  # noqa: BLE001
         log.warning("LLM summary failed: %s", e)
         return ""
