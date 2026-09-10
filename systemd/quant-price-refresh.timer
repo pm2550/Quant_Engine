@@ -1,0 +1,10 @@
+[Unit]
+Description=Full-universe price refresh (01:10 UTC — 必须早于 expectations 02:00 和 challenger 推理)
+
+[Timer]
+OnCalendar=*-*-* 01:10:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

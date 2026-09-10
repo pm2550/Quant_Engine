@@ -1,0 +1,541 @@
+"""2026-09-10 全量审计修复的回归测试。
+
+每个 test 对应 docs/AUDIT-20260910.md 里的一个编号。这批问题全是"静默失效"型 ——
+不抛异常、不告警, 只是数字悄悄变成假的, 所以必须有测试钉住。
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import date, datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+# ---------------------------------------------------------------- A2
+class TestTimestampNormalization:
+    """A2: news_archive.published_at 曾有 97% 的行是 RFC2822 原样透传。"""
+
+    def test_rfc2822(self):
+        from quant import db
+        assert db.normalize_timestamp("Fri, 03 Jul 2026 08:12:00 GMT") == "2026-07-03T08:12:00Z"
+
+    def test_rfc2822_with_offset(self):
+        from quant import db
+        # +0800 必须被换算成 UTC, 不是截断
+        assert db.normalize_timestamp("Tue, 4 Aug 2026 01:02:03 +0800") == "2026-08-03T17:02:03Z"
+
+    def test_iso_passthrough(self):
+        from quant import db
+        assert db.normalize_timestamp("2026-09-09T15:30:00Z") == "2026-09-09T15:30:00Z"
+
+    def test_eastmoney_naive(self):
+        from quant import db
+        assert db.normalize_timestamp("2026-09-09 15:30:00") == "2026-09-09T15:30:00Z"
+
+    def test_garbage_returns_none(self):
+        from quant import db
+        # 宁可 NULL 让 COALESCE(published_at, fetched_at) 接手, 也不要留会算错的字符串
+        assert db.normalize_timestamp("not a date") is None
+        assert db.normalize_timestamp("") is None
+        assert db.normalize_timestamp(None) is None
+
+    def test_output_always_sorts_chronologically(self):
+        """归一化的核心价值: 字符串排序 == 时间排序。"""
+        from quant import db
+        raw = ["Fri, 03 Jul 2026 08:12:00 GMT",
+               "Mon, 01 Jun 2026 00:00:00 GMT",
+               "2026-08-15 12:00:00"]
+        norm = sorted(db.normalize_timestamp(r) for r in raw)
+        assert norm == ["2026-06-01T00:00:00Z", "2026-07-03T08:12:00Z", "2026-08-15T12:00:00Z"]
+
+
+# ---------------------------------------------------------------- A3
+class TestFeedWeighting:
+    """A3: sources.yaml 的 weight 以前被读进 item dict 但从未用于限流。"""
+
+    def test_weight_scales_intake(self):
+        from quant import newswatch
+        assert newswatch._items_cap({"weight": 0.5}) < newswatch._items_cap({"weight": 1.5})
+
+    def test_explicit_cap_wins(self):
+        from quant import newswatch
+        assert newswatch._items_cap({"weight": 1.5, "max_items_per_poll": 8}) == 8
+
+    def test_floor_enforced(self):
+        from quant import newswatch
+        assert newswatch._items_cap({"weight": 0.01}) >= newswatch.MIN_ITEMS_PER_POLL
+
+    def test_noisy_feeds_capped_in_config(self):
+        """aljazeera / zerohedge / bbc 近 60 天刷了 11,140 条, 必须有显式上限。"""
+        from quant import config as cfg_mod, newswatch
+        feeds = {f["name"]: f for f in (cfg_mod.load("sources").get("rss_feeds") or [])}
+        for name in ("aljazeera", "zerohedge", "bbc_world"):
+            if name in feeds:
+                assert newswatch._items_cap(feeds[name]) <= 15, f"{name} 上限过高"
+
+
+# ---------------------------------------------------------------- A4
+class TestBilibiliCappedMetric:
+    """A4: total_results 恒为 1000 (API 分页上限), 趋势永远 0.0%。"""
+
+    def test_single_keyword_only(self):
+        from quant.alt_data import bilibili
+        for sym, kws in bilibili.DEFAULT_KEYWORDS.items():
+            assert len(kws) == 1, f"{sym} 有 {len(kws)} 个关键词 — 会产出互相矛盾的情绪值"
+
+    def test_cap_constant(self):
+        from quant.alt_data import bilibili
+        assert bilibili.TOTAL_RESULTS_CAP == 1000
+
+
+# ---------------------------------------------------------------- C1/C2/C3
+class TestExpectationsV2:
+    """C1/C2/C3: bootstrap_v1 20d 高估 9.3pp, 90% 区间只覆盖 71.9%。"""
+
+    @staticmethod
+    def _closes(n=900, seed=7, drift=0.0012, vol=0.02):
+        rng = np.random.default_rng(seed)
+        r = rng.normal(drift, vol, n)
+        return pd.Series(100 * np.exp(np.cumsum(r)),
+                         index=pd.date_range("2023-01-02", periods=n, freq="B"))
+
+    def test_v2_is_default(self):
+        from quant import expectations as E
+        assert E.MODEL_VERSION == "bootstrap_v2"
+        assert E.LEGACY_MODEL_VERSION == "bootstrap_v1"
+
+    def test_v2_center_is_zero(self):
+        """C1 的修法: 不再外推历史漂移。"""
+        from quant import expectations as E
+        d = E.vol_scaled_distribution(self._closes(), horizon_days=20)
+        assert d is not None
+        assert d["mean_pct"] == 0.0
+        assert d["median_pct"] == 0.0
+
+    def test_v1_extrapolates_drift_v2_does_not(self):
+        """同一段上涨数据: v1 的 mean 显著为正, v2 为 0。"""
+        from quant import expectations as E
+        c = self._closes(drift=0.003)          # 强上涨
+        v1 = E.bootstrap_distribution(c, horizon_days=20)
+        v2 = E.vol_scaled_distribution(c, horizon_days=20)
+        assert v1["mean_pct"] > 3.0, "构造的上涨样本应让 v1 外推出正漂移"
+        assert v2["mean_pct"] == 0.0
+
+    def test_sigma_k_per_horizon(self):
+        from quant import expectations as E
+        assert set(E.SIGMA_K) == {1, 5, 20}
+        # 拟合值: horizon 越长 k 越小 (长周期经验分位本身已经够宽)
+        assert E.SIGMA_K[1] > E.SIGMA_K[20]
+
+    def test_quantiles_ordered(self):
+        from quant import expectations as E
+        d = E.vol_scaled_distribution(self._closes(), horizon_days=5)
+        assert d["p5_pct"] < d["p25_pct"] < 0 < d["p75_pct"] < d["p95_pct"]
+
+    def test_sigma_scales_with_volatility(self):
+        """波动标准化的核心: 当前波动高 → 区间宽。"""
+        from quant import expectations as E
+        calm = E.vol_scaled_distribution(self._closes(vol=0.008), horizon_days=20)
+        wild = E.vol_scaled_distribution(self._closes(vol=0.035), horizon_days=20)
+        assert wild["sigma_pct"] > calm["sigma_pct"] * 1.5
+
+    def test_insufficient_data_returns_none(self):
+        from quant import expectations as E
+        assert E.vol_scaled_distribution(self._closes(n=40), horizon_days=20) is None
+
+
+# ---------------------------------------------------------------- C9/C10
+class TestThresholdsAndConviction:
+    """C9/C10: ADD 阈值 0.30 在 4 个月里只触发 3 次; conviction 双重闸门。"""
+
+    def test_add_threshold_reachable(self):
+        from quant import multi_factor as M
+        t = M.action_thresholds()
+        # composite 的 Q5 五分位均值实测 0.17 — 阈值必须低于它才可能触发
+        assert t["add"] <= 0.17, f"ADD 阈值 {t['add']} 高于实测 Q5 均值 0.17"
+
+    def test_conviction_reaches_two_at_watch_buy(self):
+        """日报按 conviction<2 过滤, 所以能触发 WATCH_BUY 的必须 >=2 星。"""
+        from quant import multi_factor as M
+        t = M.action_thresholds()
+        assert M.conviction_from_composite(t["watch_buy"]) >= 2
+        assert M.conviction_from_composite(t["add"]) >= 3
+
+    def test_conviction_monotonic(self):
+        from quant import multi_factor as M
+        vals = [M.conviction_from_composite(c) for c in (0.0, 0.03, 0.07, 0.13, 0.22, 0.35)]
+        assert vals == sorted(vals)
+
+    def test_conviction_symmetric(self):
+        from quant import multi_factor as M
+        assert M.conviction_from_composite(0.2) == M.conviction_from_composite(-0.2)
+
+    def test_cross_sectional_gate_caps_adds(self):
+        """板块同涨时 11 只一起亮 ADD 不是 11 个独立信号。"""
+        from quant import multi_factor as M
+        recs = [{"symbol": f"S{i}", "composite_score": 0.30 - 0.01 * i,
+                 "action": "ADD", "conviction": 5, "rationale": ""} for i in range(8)]
+        out = M.apply_cross_sectional_gate(recs, max_adds=3)
+        assert sum(1 for r in out if r["action"] == "ADD") == 3
+        # 保留的必须是 composite 最高的三个
+        kept = {r["symbol"] for r in out if r["action"] == "ADD"}
+        assert kept == {"S0", "S1", "S2"}
+
+    def test_gate_noop_when_under_cap(self):
+        from quant import multi_factor as M
+        recs = [{"symbol": "A", "composite_score": 0.5, "action": "ADD",
+                 "conviction": 5, "rationale": ""}]
+        assert M.apply_cross_sectional_gate(recs, max_adds=3)[0]["action"] == "ADD"
+
+    def test_demoted_become_watch_buy_not_dropped(self):
+        from quant import multi_factor as M
+        recs = [{"symbol": f"S{i}", "composite_score": 0.3 - 0.01 * i,
+                 "action": "ADD", "conviction": 5, "rationale": ""} for i in range(5)]
+        out = M.apply_cross_sectional_gate(recs, max_adds=2)
+        assert len(out) == 5
+        assert {r["action"] for r in out} == {"ADD", "WATCH_BUY"}
+
+
+# ---------------------------------------------------------------- C6
+class TestChallengerFreshness:
+    """C6: freshness 只看 JSON 文件 mtime, as_of 取字典第一个 symbol。"""
+
+    def test_split_by_freshness(self):
+        from quant.ml import serve
+        today = date(2026, 9, 10)
+        preds = {
+            "FRESH": {"pred_forward_return": 0.03, "as_of": "2026-09-09"},
+            "STALE": {"pred_forward_return": 0.07, "as_of": "2026-03-20"},
+            "NOASOF": {"pred_forward_return": 0.02},
+        }
+        fresh, stale = serve.split_by_freshness(preds, today=today)
+        assert set(fresh) == {"FRESH"}
+        assert set(stale) == {"STALE", "NOASOF"}, "缺 as_of 必须按陈旧处理"
+
+    def test_stale_days(self):
+        from quant.ml import serve
+        assert serve.stale_days({"as_of": "2026-09-01"}, today=date(2026, 9, 10)) == 9
+        assert serve.stale_days({}, today=date(2026, 9, 10)) is None
+
+
+# ---------------------------------------------------------------- D2
+class TestBacktestFiniteGuards:
+    """D2: 0 笔交易 → 方差 0 → sharpe=Inf, 11,251 条假记录顶满榜首。"""
+
+    def test_finite_filters_inf(self):
+        from quant import backtest
+        assert backtest._finite(float("inf")) == 0.0
+        assert backtest._finite(float("-inf")) == 0.0
+        assert backtest._finite(float("nan")) == 0.0
+
+    def test_finite_passes_real_values(self):
+        from quant import backtest
+        assert backtest._finite(2.65) == 2.65
+        assert backtest._finite(-0.5) == -0.5
+
+    def test_finite_handles_non_numeric(self):
+        from quant import backtest
+        assert backtest._finite(None) == 0.0
+        assert backtest._finite("abc") == 0.0
+
+    def test_no_inf_in_db(self):
+        """数据层面的回归哨兵 —— 历史 Inf 已回填。"""
+        from quant import db
+        with sqlite3.connect(db.DB_PATH) as conn:
+            bad = conn.execute(
+                "SELECT COUNT(*) FROM backtest_results "
+                "WHERE sharpe > 1e6 OR sharpe < -1e6 OR profit_factor > 1e6").fetchone()[0]
+        assert bad == 0
+
+
+# ---------------------------------------------------------------- E3
+class TestCrossCurrencyWeights:
+    """E3: 权重按币种桶算 → 唯一的 CNY 持仓永远 100% → 每日假警告。"""
+
+    def test_usd_is_identity(self):
+        from quant import orchestrator
+        assert orchestrator.fx_to_usd("USD") == 1.0
+
+    def test_cny_rate_plausible(self):
+        from quant import orchestrator
+        r = orchestrator.fx_to_usd("CNY")
+        assert 0.08 < r < 0.25, f"CNY→USD {r} 不合理"
+
+    def test_unknown_currency_falls_back(self):
+        from quant import orchestrator
+        assert orchestrator.fx_to_usd("XYZ") == 1.0
+
+    def test_single_cny_position_not_100pct_globally(self):
+        """核心回归: 单一 CNY 持仓 + 多个 USD 持仓 → 它的全局权重远低于 100%。"""
+        from quant import orchestrator
+        mv = {"002624.SZ": ("CNY", 2170.0), "VOO": ("USD", 1000.0), "AMD": ("USD", 742.0)}
+        usd = {s: v * orchestrator.fx_to_usd(c) for s, (c, v) in mv.items()}
+        total = sum(usd.values())
+        w = usd["002624.SZ"] / total
+        assert w < 0.30, f"002624 全局权重 {w:.1%} 仍超 30% 上限 — 会继续报假警告"
+
+
+# ---------------------------------------------------------------- C4
+class TestCalibration:
+    """C4: expectations.py 自承校准追踪未实现, 4 个月没人补。"""
+
+    def test_rank_ic_detects_positive_signal(self):
+        from quant import calibration
+        df = pd.DataFrame({
+            "snapshot_date": ["2026-01-01"] * 6 + ["2026-01-02"] * 6,
+            "symbol": list("ABCDEF") * 2,
+            "pred": [5, 4, 3, 2, 1, 0] * 2,
+            "real": [5, 4, 3, 2, 1, 0] * 2,
+        })
+        r = calibration._rank_ic_stats(df, "pred", "real")
+        assert r["daily_rank_ic"] == pytest.approx(1.0)
+        assert r["ic_positive_day_pct"] == pytest.approx(100.0)
+
+    def test_rank_ic_detects_inverted_signal(self):
+        """这正是 challenger 的实际情况 (daily IC −0.216)。"""
+        from quant import calibration
+        df = pd.DataFrame({
+            "snapshot_date": ["2026-01-01"] * 6 + ["2026-01-02"] * 6,
+            "symbol": list("ABCDEF") * 2,
+            "pred": [5, 4, 3, 2, 1, 0] * 2,
+            "real": [0, 1, 2, 3, 4, 5] * 2,
+        })
+        r = calibration._rank_ic_stats(df, "pred", "real")
+        assert r["daily_rank_ic"] == pytest.approx(-1.0)
+        assert r["ic_positive_day_pct"] == pytest.approx(0.0)
+
+    def test_daily_ic_skips_thin_cross_sections(self):
+        from quant import calibration
+        df = pd.DataFrame({
+            "snapshot_date": ["2026-01-01"] * 2,
+            "symbol": ["A", "B"],
+            "pred": [1, 2], "real": [1, 2],
+        })
+        r = calibration._rank_ic_stats(df, "pred", "real")
+        assert r["n_days"] == 0, "2 只标的的截面不该算 IC"
+
+    def test_forward_return_refuses_stale_prices(self):
+        """绝不拿"最后一根可用 K 线"冒充 horizon 后的价格。"""
+        from quant import calibration
+        # 未来日期 → 必然没有 horizon 后的价格
+        future = (date.today() + timedelta(days=5)).isoformat()
+        assert calibration.forward_return_pct("AMD", future, 20) is None
+
+    def test_tables_exist(self):
+        from quant import db
+        db.init()
+        with sqlite3.connect(db.DB_PATH) as conn:
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"model_predictions", "model_calibration"} <= names
+
+
+# ---------------------------------------------------------------- D5/D6
+class TestDecisionReview:
+    """D5: WATCH_SKIP "<5% 算对" 在牛市里恒为真。D6: HOLD 不入库。"""
+
+    def test_hold_is_loggable(self):
+        from quant import decision_log
+        assert "HOLD" in decision_log.LOGGABLE_ACTIONS
+
+    def test_watch_skip_not_scored(self):
+        from quant import decision_review as D
+        assert D._was_correct(-1, 2.0, "WATCH_SKIP") is None
+        assert D._was_correct(-1, 50.0, "WATCH_SKIP") is None
+
+    def test_hold_not_scored(self):
+        from quant import decision_review as D
+        assert D._was_correct(0, 5.0, "HOLD") is None
+
+    def test_directional_actions_still_scored(self):
+        from quant import decision_review as D
+        assert D._was_correct(1, 3.0, "ADD") == 1
+        assert D._was_correct(1, -3.0, "ADD") == 0
+        assert D._was_correct(-1, -3.0, "REDUCE") == 1
+        assert D._was_correct(-1, 3.0, "REDUCE") == 0
+
+    def test_no_five_pct_grace_band(self):
+        """旧逻辑里 REDUCE 后涨 4% 也算"对" —— 必须已废除。"""
+        from quant import decision_review as D
+        assert D._was_correct(-1, 4.0, "REDUCE") == 0
+
+
+# ---------------------------------------------------------------- A1
+class TestPriceRefresh:
+    """A1: 159 只里 143 只冻结数月, 无人发现。"""
+
+    def test_staleness_report_shape(self):
+        from quant import price_refresh
+        rep = price_refresh.staleness_report()
+        assert "total" in rep and "buckets" in rep
+        assert isinstance(rep["stale_over_30d"], list)
+
+    def test_universe_includes_cached(self):
+        from quant import price_refresh
+        syms = price_refresh.universe_symbols()
+        assert len(syms) > 50, "全宇宙应该有上百只"
+
+    def test_delisted_dir_separate_from_active(self):
+        from quant import price_refresh
+        assert price_refresh.DELISTED_DIR.name.startswith("_"), \
+            "隔离目录要以 _ 开头, 否则会被 glob('*.parquet') 扫进活跃宇宙"
+        # 隔离目录不能被 cached_symbols 扫到
+        assert not any(s.startswith("_") for s in price_refresh.cached_symbols())
+
+
+# ---------------------------------------------------------------- B2
+class TestRateLimitHandling:
+    """B2: 429 时立刻跳下一个 backend, 而下一个也是 ollama → 整条链一起失败。"""
+
+    def test_detects_rate_limit_variants(self):
+        from quant import llm_router as R
+        for msg in ("429 Client Error: Too Many Requests",
+                    "rate limit exceeded", "quota exhausted", "Too Many Requests"):
+            assert R._is_rate_limited(Exception(msg)), msg
+
+    def test_ignores_other_errors(self):
+        from quant import llm_router as R
+        for msg in ("connection reset", "401 Unauthorized", "timeout"):
+            assert not R._is_rate_limited(Exception(msg)), msg
+
+    def test_cooldown_roundtrip(self):
+        from quant import llm_router as R
+        R._COOLDOWN_UNTIL.clear()
+        assert R._cooling("ollama:test") == 0
+        R._enter_cooldown("ollama:test", seconds=30)
+        assert 0 < R._cooling("ollama:test") <= 30
+        assert "ollama:test" in R.rate_limit_state()
+        R._COOLDOWN_UNTIL.clear()
+
+    def test_backoff_schedule_increases(self):
+        from quant import llm_router as R
+        assert list(R.RATE_LIMIT_BACKOFF_S) == sorted(R.RATE_LIMIT_BACKOFF_S)
+
+
+# ---------------------------------------------------------------- B1
+class TestDeadProviderCleanup:
+    """B1: dashscope 2026-06-01 下线, 但配置/校验/smoke 仍要求它。"""
+
+    def test_no_routes_reference_dashscope(self):
+        from quant import config as cfg_mod
+        cfg = cfg_mod.load("llm_routes")
+        for task, chain in (cfg.get("routes") or {}).items():
+            for entry in chain:
+                assert not entry.startswith("dashscope:"), \
+                    f"route {task} 仍指向已下线的 dashscope ({entry})"
+
+    def test_dashscope_provider_not_enabled(self):
+        from quant import config as cfg_mod
+        assert "dashscope" not in (cfg_mod.load("llm_routes").get("providers") or {})
+
+
+# ---------------------------------------------------------------- E 报告
+class TestReportConditionalSections:
+    """E2/E4/E7: 四个静态段无条件 append, 129 行说 2 行内容。"""
+
+    def test_macro_has_conditional_modes(self):
+        from quant import macro_regime
+        import inspect
+        sig = inspect.signature(macro_regime.render_section)
+        assert "only_on_change" in sig.parameters
+        assert "one_line" in sig.parameters
+
+    def test_alt_data_has_conditional_modes(self):
+        from quant.alt_data import formatter
+        import inspect
+        sig = inspect.signature(formatter.render_section)
+        assert "only_if_anomaly" in sig.parameters
+        assert "one_line" in sig.parameters
+
+    def test_events_digest_defaults_to_two(self):
+        from quant import events_digest
+        import inspect
+        sig = inspect.signature(events_digest.render_section)
+        assert sig.parameters["top_k"].default == 2
+
+    def test_base_rate_needs_real_sample(self):
+        """n=7~15 的历史中位数没有决策价值。"""
+        from quant import events_digest
+        assert events_digest.MIN_BASE_RATE_N >= 30
+
+    def test_packager_requires_plain_summary(self):
+        from quant import llm_packager
+        assert "一句人话总结" in llm_packager.SYSTEM_PROMPT
+
+    def test_packager_has_no_dead_model_reference(self):
+        from quant import llm_packager
+        assert "deepseek" not in llm_packager.SYSTEM_PROMPT.lower()
+
+
+# ---------------------------------------------------------------- A7
+class TestBilibiliClickOrderDegradation:
+    """A7 (生产验证时发现): B 站偶发忽略 order=click, 返回按相关度排序的结果。
+
+    不报错, 只是 top_avg_plays 悄悄变成另一个数量级 —— 实测同一天同一关键词
+    5,893,843 vs 433,885 (差 13 倍), 随后触发一次假的 "7d −92.6%" 异动告警。
+    """
+
+    def test_trend_suppresses_plays_pct_when_unreliable(self, tmp_path, monkeypatch):
+        from quant import db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.sqlite")
+        db.init()
+        from quant.alt_data import bilibili
+        old = (date.today() - timedelta(days=8)).isoformat()
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 5_000_000,
+                                       "top_plays_reliable": True}, metric_date=old)
+        # 今天这条是降级抓取 → 不可靠
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 400_000,
+                                       "top_plays_reliable": False},
+                                metric_date=date.today().isoformat())
+        t = bilibili.trend("K")
+        assert t["top_plays_reliable"] is False
+        assert t["vs_7d_ago"]["top_avg_plays_pct"] is None, \
+            "不可靠的快照不能报出 -92% 这种假趋势"
+
+    def test_trend_reports_pct_when_both_reliable(self, tmp_path, monkeypatch):
+        from quant import db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.sqlite")
+        db.init()
+        from quant.alt_data import bilibili
+        old = (date.today() - timedelta(days=8)).isoformat()
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 1000,
+                                       "top_plays_reliable": True}, metric_date=old)
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 500,
+                                       "top_plays_reliable": True},
+                                metric_date=date.today().isoformat())
+        t = bilibili.trend("K")
+        assert t["vs_7d_ago"]["top_avg_plays_pct"] == -50.0
+
+    def test_legacy_rows_without_flag_treated_as_reliable(self, tmp_path, monkeypatch):
+        """A7 之前的历史行没有这个字段, 不能因此全部失效。"""
+        from quant import db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.sqlite")
+        db.init()
+        from quant.alt_data import bilibili
+        old = (date.today() - timedelta(days=8)).isoformat()
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 1000},
+                                metric_date=old)
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 800},
+                                metric_date=date.today().isoformat())
+        t = bilibili.trend("K")
+        assert t["vs_7d_ago"]["top_avg_plays_pct"] == -20.0
+
+    def test_anomaly_does_not_fire_on_unreliable_snapshot(self, tmp_path, monkeypatch):
+        """最终目的: 降级抓取不得触发告警。"""
+        from quant import db
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.sqlite")
+        db.init()
+        from quant.alt_data import bilibili, anomaly
+        old = (date.today() - timedelta(days=8)).isoformat()
+        sent = {"overall_sentiment": 0.3, "buzz_phase": "sustained"}
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 5_000_000,
+                                       "top_plays_reliable": True, "sentiment": sent},
+                                metric_date=old)
+        bilibili.store_snapshot("K", {"total_results": 900, "top_avg_plays": 400_000,
+                                       "top_plays_reliable": False, "sentiment": sent},
+                                metric_date=date.today().isoformat())
+        sigs = {f["signal"] for f in anomaly.check_keyword("K", dry_run=True)}
+        assert "plays_drop" not in sigs, "降级抓取触发了假告警"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily model calibration (03:30 UTC — 在 price_refresh / expectations 之后)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

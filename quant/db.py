@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "quant.sqlite"
@@ -276,6 +276,42 @@ CREATE INDEX IF NOT EXISTS idx_expectations_symbol ON expectations(symbol, horiz
 -- Decision log: persist each non-HOLD recommendation so we can review predictive accuracy
 -- 30 days later. Drives calibration / hit_rate dashboards instead of guessing whether the
 -- engine is right. Written by daily.py at end of run.
+CREATE TABLE IF NOT EXISTS model_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date TEXT NOT NULL,       -- 生成这条预测的日期 (报告日)
+    model TEXT NOT NULL,               -- 'challenger_lgbm' / 'bootstrap_v1' / ...
+    symbol TEXT NOT NULL,
+    horizon_days INTEGER NOT NULL,
+    pred_value REAL NOT NULL,          -- 预测的 forward return (小数, 0.03 = +3%)
+    as_of TEXT,                        -- 特征实际截止日 —— 与 snapshot_date 不同即为陈旧
+    anchor_close REAL,                 -- snapshot_date 当日收盘 (算实际收益的锚)
+    stale_days INTEGER,                -- snapshot_date - as_of 的日历天数
+    extra_json TEXT,                   -- n_features / missing_features 等
+    -- 事后回填:
+    realized_pct REAL,                 -- 实际 forward return (%)
+    scored_at TEXT,
+    UNIQUE(snapshot_date, model, symbol, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS idx_modelpred_date ON model_predictions(snapshot_date DESC, model);
+CREATE INDEX IF NOT EXISTS idx_modelpred_pending ON model_predictions(scored_at, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_modelpred_symbol ON model_predictions(model, symbol, snapshot_date DESC);
+
+CREATE TABLE IF NOT EXISTS model_calibration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    computed_at TEXT NOT NULL,
+    model TEXT NOT NULL,
+    horizon_days INTEGER NOT NULL,
+    window_days INTEGER NOT NULL,      -- 评估窗口
+    n_samples INTEGER NOT NULL,
+    -- 分布类模型 (expectations) 的校准指标
+    coverage_90 REAL, coverage_50 REAL, bias_pp REAL, sigma_ratio REAL,
+    -- 排序类模型 (challenger / composite) 的预测力指标
+    rank_ic REAL, daily_rank_ic REAL, ic_positive_day_pct REAL,
+    notes TEXT,
+    UNIQUE(computed_at, model, horizon_days, window_days)
+);
+CREATE INDEX IF NOT EXISTS idx_modelcalib ON model_calibration(model, horizon_days, computed_at DESC);
+
 CREATE TABLE IF NOT EXISTS decision_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     decided_at TEXT NOT NULL,
@@ -308,6 +344,55 @@ def conn():
         yield c
     finally:
         c.close()
+
+
+def normalize_timestamp(raw) -> str | None:
+    """把各路来源的时间戳统一成 ISO-8601 UTC (带 Z)。
+
+    A2 (2026-09-10): news_archive.published_at 原来是各 RSS feed 的原样字符串 ——
+    16,273 行里 15,743 行是 RFC2822 ("Fri, 03 Jul 2026 08:12:00 GMT"), 只有 481 行
+    是 ISO。后果:
+      · event_aggregator.py 的 datetime.fromisoformat() 在 97% 的行上抛异常
+      · universe_discovery.py 的 `published_at >= '2026-08-01'` 是字符串比较,
+        "Fri, 03..." 和 ISO 日期比大小毫无意义 → 时间窗口筛选静默失效
+      · 按月聚合会冒出 160+ 个 "Fri, 03" / "Mon, 01" 这样的伪月份
+    东财的 A 股新闻还是第三种格式 ("2026-09-09 15:30:00", 无时区)。
+
+    解析不出来返回 None —— 宁可是 NULL 让 COALESCE(published_at, fetched_at) 接手,
+    也不要留一个会让下游静默算错的字符串。
+    """
+    if raw is None:
+        return None
+    t = str(raw).strip()
+    if not t:
+        return None
+    # 1) 已经是 ISO
+    try:
+        dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        pass
+    # 2) RFC2822 / RFC1123 (RSS 的标准格式)
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(t)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, IndexError):
+        pass
+    # 3) 东财等: "2026-09-09 15:30:00"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                 "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(t, fmt).replace(tzinfo=timezone.utc)
+            return dt.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            continue
+    return None
 
 
 def init() -> None:

@@ -53,18 +53,45 @@ def _kw_filter(title: str, content: str, kw_cfg: dict) -> tuple[bool, int]:
 
 
 # ---- RSS fetching ----
+BASE_ITEMS_PER_POLL = 30
+MIN_ITEMS_PER_POLL = 5
+
+
+def _items_cap(feed_cfg: dict) -> int:
+    """每次轮询从该 feed 取多少条 —— 由 weight 决定。
+
+    A3 (2026-09-10): sources.yaml 里每个 feed 都有 weight, 但 newswatch 只是把它
+    塞进 item dict, 从没用它限流 —— 所有 feed 一律取 30 条。结果近 60 天:
+        aljazeera (weight 0.6)                5,126 条
+        zerohedge (weight 0.5)                3,568 条
+        bbc_world (weight 0.8)                2,446 条
+        semiconductor_engineering               439 条
+        nextplatform                            99 条
+    通用时政源把半导体专业源淹没了 11 : 1, 这正是 events 表里 geopolitical 长期
+    占比第一的原因 (2026-06 单月 914 条)。低权重源少取, 同时也直接减少 LLM 打分
+    调用量 —— 对 B2 的 429 问题有帮助。
+    显式 max_items_per_poll 优先于 weight 推导值。
+    """
+    explicit = feed_cfg.get("max_items_per_poll")
+    if explicit:
+        return max(MIN_ITEMS_PER_POLL, int(explicit))
+    w = float(feed_cfg.get("weight", 1.0) or 1.0)
+    return max(MIN_ITEMS_PER_POLL, round(BASE_ITEMS_PER_POLL * w))
+
+
 def _fetch_feed(feed_cfg: dict) -> list[dict]:
     """Fetch one RSS feed, return list of {url, title, content, source, published_at}."""
     url = feed_cfg["url"]
     name = feed_cfg["name"]
-    log.debug("fetching %s", name)
+    cap = _items_cap(feed_cfg)
+    log.debug("fetching %s (cap %d)", name, cap)
     try:
         d = feedparser.parse(url)
     except Exception as e:  # noqa: BLE001
         log.warning("feed %s failed: %s", name, e)
         return []
     items = []
-    for entry in d.entries[:30]:
+    for entry in d.entries[:cap]:
         link = getattr(entry, "link", None)
         title = getattr(entry, "title", None)
         if not link or not title:
@@ -93,7 +120,8 @@ def _dedupe_and_store(items: list[dict]) -> list[tuple[int, dict]]:
                 cur = conn.execute(
                     "INSERT INTO news_archive(url, title, source, published_at, content, raw_hash, fetched_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (it["url"], it["title"], it["source"], it.get("published_at"),
+                    (it["url"], it["title"], it["source"],
+                     db.normalize_timestamp(it.get("published_at")),   # A2
                      it["content"], raw_hash, datetime.utcnow().isoformat() + "Z"),
                 )
                 new_items.append((cur.lastrowid, it))

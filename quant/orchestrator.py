@@ -71,6 +71,42 @@ from . import fetcher, signals, recommender, fundamentals, multi_factor, db as d
 log = logging.getLogger(__name__)
 
 
+# ---- 跨币种换算 (E3, 2026-09-10) -------------------------------------------
+# 之前权重是"持仓市值 / 同币种总市值", 而 002624 是唯一 CNY 持仓 → 它的权重恒为
+# 100%, 于是风险检查每天都报"单股权重 100.0% 超过 30% 上限"。那是算法产物, 不是
+# 真实集中度。同币种权重对"同币种内怎么调仓"仍然正确, 所以两个都保留:
+#   weights        — 按币种桶 (用于 target_weight / delta_shares 计算)
+#   weights_global — 全部折成 USD 后的真实组合占比 (用于风险/集中度检查)
+FX_FILES = {"CNY": "usdcny.parquet", "JPY": "usdjpy.parquet"}
+FX_FALLBACK = {"USD": 1.0, "CNY": 1.0 / 7.1, "JPY": 1.0 / 155.0}
+
+
+def fx_to_usd(currency: str) -> float:
+    """1 单位该币种值多少美元。取不到行情时回落到 FX_FALLBACK 并告警。"""
+    cur = (currency or "USD").upper()
+    if cur == "USD":
+        return 1.0
+    fname = FX_FILES.get(cur)
+    if fname:
+        p = Path("/data2/quant/data/macro") / fname
+        if p.exists():
+            try:
+                import pandas as pd
+                df = pd.read_parquet(p)
+                col = "close" if "close" in df.columns else df.columns[0]
+                rate = float(df[col].dropna().iloc[-1])   # 该行情是 USD→外币 的报价
+                if rate > 0:
+                    return 1.0 / rate
+            except Exception as e:  # noqa: BLE001
+                log.warning("fx_to_usd(%s) 读取 %s 失败: %s", cur, fname, e)
+    fb = FX_FALLBACK.get(cur)
+    if fb is None:
+        log.warning("fx_to_usd(%s): 无汇率数据且无回落值, 按 1.0 处理", cur)
+        return 1.0
+    log.warning("fx_to_usd(%s): 用回落汇率 %.4f", cur, fb)
+    return fb
+
+
 def run(*, full_refresh: bool = False) -> dict:
     portfolio = cfg_mod.load("portfolio")
     strategies = cfg_mod.load("strategies")
@@ -126,10 +162,17 @@ def run(*, full_refresh: bool = False) -> dict:
         c = ccy_of(sym)
         totals_by_ccy[c] = totals_by_ccy.get(c, 0.0) + mv
 
-    # Weight = position value / its-currency total
+    # Weight = position value / its-currency total (同币种内调仓用这个)
     weights = {
         sym: (mv / totals_by_ccy[ccy_of(sym)] if totals_by_ccy.get(ccy_of(sym)) else 0.0)
         for sym, mv in market_values.items()
+    }
+
+    # 跨币种真实权重: 全部折成 USD 再算占比 (风险/集中度检查用这个) —— E3
+    mv_usd = {sym: mv * fx_to_usd(ccy_of(sym)) for sym, mv in market_values.items()}
+    total_usd = sum(mv_usd.values())
+    weights_global = {
+        sym: (v / total_usd if total_usd else 0.0) for sym, v in mv_usd.items()
     }
 
     # Daily change per currency bucket
@@ -191,7 +234,12 @@ def run(*, full_refresh: bool = False) -> dict:
         rec = recommender.for_watch_multi_factor(sigs[sym], multi_scores.get(sym, {}))
         recs.append(enrich(recommender.to_dict(rec), sym))
 
-    # Concentration risk (only flag within the same currency bucket)
+    # 横截面闸门 (C9): 同一天只让 composite 最高的 N 个保留 ADD。composite 的逐日
+    # 截面 rank IC = +0.436 但时序 IC ≈ 0 —— 板块同涨时 11 只一起亮 ADD 不是 11 个
+    # 独立信号。超出上限的降级为 WATCH_BUY。
+    recs = multi_factor.apply_cross_sectional_gate(recs)
+
+    # Concentration risk (now measured on cross-currency weights — see E3)
     def _name_of(sym: str) -> str:
         # 美股直接用代号 (主人都认识 VOO/AMD/...). A 股用 "中文名 (六位代号)"
         if fetcher.is_a_share(sym):
@@ -203,7 +251,8 @@ def run(*, full_refresh: bool = False) -> dict:
     risk_notes: list[str] = []
     risk_cfg = portfolio.get("risk", {})
     cap = risk_cfg.get("position_concentration_max", 0.30)
-    for sym, w in weights.items():
+    # E3: 用跨币种权重, 否则唯一的 CNY 持仓永远是"100%"
+    for sym, w in weights_global.items():
         if w > cap:
             risk_notes.append(
                 f"{_name_of(sym)} 单股权重 {w*100:.1f}% 超过 {cap*100:.0f}% 上限"
@@ -211,7 +260,7 @@ def run(*, full_refresh: bool = False) -> dict:
 
     overlap = portfolio.get("sector_overlap", {})
     for sector, members in overlap.items():
-        sw = sum(weights.get(m, 0.0) for m in members)
+        sw = sum(weights_global.get(m, 0.0) for m in members)
         if sw > 0.5:
             risk_notes.append(
                 f"{sector} 板块合计 {sw*100:.1f}%（{', '.join(_name_of(m) for m in members)}）"
@@ -254,6 +303,7 @@ def run(*, full_refresh: bool = False) -> dict:
             "total_value_usd": round(totals_by_ccy.get("USD", 0.0), 2),
             "chg_1d_pct": round(chg_by_ccy.get("USD", 0.0), 2),
             "weights": {k: round(v, 4) for k, v in weights.items()},
+            "weights_global": {k: round(v, 4) for k, v in weights_global.items()},
             "market_values": {k: round(v, 2) for k, v in market_values.items()},
             "currencies": {sym: ccy_of(sym) for sym in market_values},
         },

@@ -11,7 +11,7 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 QLIB_PYTHON = Path("/data2/quant/qlib_env/bin/python")
 PREDICTIONS_JSON = Path("/data2/quant/results/challenger_today.json")
 MODEL_PATH = Path("/data2/quant/models/challenger_lgbm.txt")
-MAX_STALE_HOURS = 36  # accept yesterday's predictions on failure, not older
+MAX_STALE_HOURS = 36   # accept yesterday's predictions on failure, not older
+MAX_STALE_DAYS = 3     # C6: 单个 symbol 的 as_of 落后超过这么多天就不参与排序
 
 
 def _refresh(symbols: list[str] | None = None, *, timeout: int = 60) -> bool:
@@ -51,6 +52,37 @@ def _refresh(symbols: list[str] | None = None, *, timeout: int = 60) -> bool:
     return True
 
 
+def stale_days(info: dict, *, today: date | None = None) -> int | None:
+    """单条预测的陈旧天数 = today - as_of。取不到 as_of 返回 None。"""
+    a = info.get("as_of")
+    if not a:
+        return None
+    try:
+        d = datetime.strptime(str(a)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return ((today or date.today()) - d).days
+
+
+def split_by_freshness(preds: dict, *, max_stale_days: int = MAX_STALE_DAYS,
+                        today: date | None = None) -> tuple[dict, dict]:
+    """把预测分成 (可用, 陈旧)。
+
+    C6 (2026-09-10): 之前 freshness 只看 JSON 文件 mtime —— 那个文件每天都被重写,
+    所以永远是 "fresh"; 而 as_of 取的是 dict 里第一个 symbol 的值。实际上 159 只里
+    有 74 只的特征停在 2026-05-26 (价格 parquet 没再刷新, 见 A1), 于是半年前的预测
+    和当天的预测被混在一起排序, "Top 5 看多"榜首 CELT 的特征日期是 2026-03-20。
+    """
+    fresh, stale = {}, {}
+    for sym, info in (preds or {}).items():
+        sd = stale_days(info, today=today)
+        if sd is None or sd > max_stale_days:
+            stale[sym] = info
+        else:
+            fresh[sym] = info
+    return fresh, stale
+
+
 def _load_cached_predictions() -> tuple[dict | None, str]:
     """Return (preds, status) where status is 'fresh' / 'stale' / 'missing'."""
     if not PREDICTIONS_JSON.exists():
@@ -64,8 +96,46 @@ def _load_cached_predictions() -> tuple[dict | None, str]:
     except Exception as e:  # noqa: BLE001
         log.warning("failed to read predictions json: %s", e)
         return None, "missing"
+    fresh, stale = split_by_freshness(preds)
     status = "fresh" if age_hours < 6 else f"cached ({age_hours:.0f}h old)"
+    status = f"{status}; {len(fresh)}/{len(preds)} 只特征在 {MAX_STALE_DAYS} 天内"
     return preds, status
+
+
+def persist_predictions(preds: dict, *, snapshot_date: str | None = None,
+                         model: str = "challenger_lgbm") -> int:
+    """把当天的预测写进 model_predictions, 供日后事后验证 (C7)。
+
+    以前预测只存在一个每天被覆盖的 JSON 里, 所以无法算真实 IC —— 我们只有训练时的
+    OOS 数字 (+0.049)。落库后 daily 复盘可以回填 realized_pct 算出实际表现。
+    """
+    if not preds:
+        return 0
+    from quant import db
+    snapshot_date = snapshot_date or date.today().isoformat()
+    db.init()
+    n = 0
+    with db.conn() as c:
+        for sym, info in preds.items():
+            try:
+                pv = float(info["pred_forward_return"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            sd = stale_days(info, today=date.fromisoformat(snapshot_date))
+            c.execute(
+                """INSERT OR REPLACE INTO model_predictions
+                   (snapshot_date, model, symbol, horizon_days, pred_value, as_of,
+                    stale_days, extra_json)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (snapshot_date, model, sym, int(info.get("horizon_days", 20)), pv,
+                 info.get("as_of"), sd,
+                 json.dumps({k: v for k, v in info.items()
+                             if k not in ("pred_forward_return", "as_of", "horizon_days")},
+                            ensure_ascii=False)),
+            )
+            n += 1
+    log.info("persisted %d challenger predictions for %s", n, snapshot_date)
+    return n
 
 
 def get_predictions(symbols: list[str] | None = None,
@@ -97,10 +167,18 @@ def render_section(preds: dict, *,
     as_of = next(iter(preds.values())).get("as_of", "?")
     held_set = set(held_symbols or [])
 
+    # C8 (2026-09-10): 模型输出是一个**恒为正**的水平值 (实测 156 只全部 +1.5%~+5.3%,
+    # 零负值), 所以旧标题里的 "Bottom 5 (看空)" 是错的 —— 那 5 只的预测也是看涨,
+    # 只是相对最弱。这个模型只能用来排序, 不能当收益预测读。
+    # 另外旧标题印的 "OOS: IC +0.049" 是训练时交叉验证值; 实测逐日截面 rank IC 是
+    # −0.216 (964 条已打分预测 / 69 只标的 / 45 个交易日)。印训练指标会误导。
+    preds_list = [v.get("pred_forward_return", 0.0) for v in preds.values()]
+    n_neg = sum(1 for p in preds_list if p < 0)
     lines = [
-        "📊 *LightGBM Challenger* (Alpha158+macro+EDGAR, 161 特征)",
-        f"as_of: {as_of}, 预测 {horizon}d 收益; freshness: {freshness}",
-        "OOS: IC +0.049 / RankIC +0.040 / TopDecile Spread +3.5%/20d",
+        "📊 *LightGBM Challenger* (Alpha158+macro+EDGAR, 161 特征) — **仅供排序, 非收益预测**",
+        f"as_of: {as_of}, horizon {horizon}d; freshness: {freshness}",
+        f"⚠️ 实测逐日截面 rank IC 为负, 不要据此下单; 校准实绩见 /api/calibration",
+        f"_本批 {len(preds_list)} 只中 {n_neg} 只为负 —— 模型存在正向水平偏移_",
     ]
 
     def _disagree_marker(sym: str, pred: float) -> str:
@@ -113,13 +191,13 @@ def render_section(preds: dict, *,
             return f" ⚠️ 分歧 (composite={a})"
         return ""
 
-    lines.append("\n*Top 5 看多:*")
+    lines.append("\n*相对最强 5 只 (排序, 非看多):*")
     for sym, info in items[:top_k]:
         p = info["pred_forward_return"]
         marker = " ⭐持仓" if sym in held_set else ""
         lines.append(f"  {sym}{marker}: {p:+.2%}{_disagree_marker(sym, p)}")
 
-    lines.append("\n*Bottom 5 (看空 / 跑输概率高):*")
+    lines.append("\n*相对最弱 5 只 (注意: 预测值可能仍为正):*")
     for sym, info in items[-top_k:][::-1]:
         p = info["pred_forward_return"]
         marker = " ⭐持仓" if sym in held_set else ""

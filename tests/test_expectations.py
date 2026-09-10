@@ -75,9 +75,17 @@ def test_snapshot_symbol_writes_one_row_per_horizon(temp_db, monkeypatch):
 
     with temp_db.conn() as c:
         rows = c.execute("SELECT * FROM expectations WHERE symbol='FAKE'").fetchall()
-    assert len(rows) == 3
-    horizons = sorted(r["horizon_days"] for r in rows)
-    assert horizons == [1, 5, 20]
+    # 2026-09-10 起每个 horizon 写两个版本 (bootstrap_v2 主用 + bootstrap_v1 保留),
+    # 这样 quant.calibration 能持续对比两者, 万一 v2 在别的 regime 下更差可以有据回退。
+    assert len(rows) == 6
+    versions = {r["model_version"] for r in rows}
+    assert versions == {exp.MODEL_VERSION, exp.LEGACY_MODEL_VERSION}
+    for v in versions:
+        hs = sorted(r["horizon_days"] for r in rows if r["model_version"] == v)
+        assert hs == [1, 5, 20], f"{v} 缺 horizon"
+    # v2 的中心必须是 0 (不外推历史漂移)
+    v2_rows = [r for r in rows if r["model_version"] == exp.MODEL_VERSION]
+    assert all(r["mean_pct"] == 0.0 for r in v2_rows)
 
 
 def test_snapshot_symbol_replace_on_same_day(temp_db, monkeypatch):
@@ -91,7 +99,12 @@ def test_snapshot_symbol_replace_on_same_day(temp_db, monkeypatch):
     exp.snapshot_symbol("X", horizons=(5,), snapshot_date="2026-05-06")
     with temp_db.conn() as c:
         n = c.execute("SELECT COUNT(*) FROM expectations WHERE symbol='X'").fetchone()[0]
-    assert n == 1
+        per_version = dict(c.execute(
+            "SELECT model_version, COUNT(*) FROM expectations WHERE symbol='X' "
+            "GROUP BY model_version").fetchall())
+    # 两个版本各 1 行, 重复调用不新增 (UNIQUE on snapshot_date+symbol+horizon+version)
+    assert n == 2
+    assert set(per_version.values()) == {1}
 
 
 def test_snapshot_symbol_skips_no_data(temp_db, monkeypatch):

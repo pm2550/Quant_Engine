@@ -1169,14 +1169,22 @@ def scenario(req: ScenarioRequest) -> dict:
 
 @app.get("/api/backtest")
 def backtest_query(symbol: Optional[str] = None, strategy: Optional[str] = None,
-                    min_sharpe: Optional[float] = None, limit: int = 20) -> dict:
+                    min_sharpe: Optional[float] = None, min_trades: int = 5,
+                    limit: int = 20) -> dict:
     """Browse backtest results from SQLite.
 
     Returns top-N results sorted by Sharpe; filterable by symbol/strategy.
     Backtest worker writes here continuously (24/7 background service).
+
+    min_trades 默认 5 (D3, 2026-09-10): 零交易的回测是退化结果 —— 历史上它们
+    还带着 sharpe=Inf 顶满榜首 (已在 backtest.py:_finite 修掉并回填)。即使归零后,
+    零交易结果对"哪个参数好"也没有信息量, 所以默认排除。传 min_trades=0 可看全部。
     """
     where = []
     params: list = []
+    if min_trades:
+        where.append("r.n_trades >= ?")
+        params.append(min_trades)
     if symbol:
         where.append("t.symbol = ?")
         params.append(symbol.upper())
@@ -1698,6 +1706,83 @@ def tax_lots_list(symbol: Optional[str] = None, open_only: bool = False) -> dict
     from . import tax
     rows = tax.list_lots(symbol=symbol, open_only=open_only)
     return {"n_lots": len(rows), "lots": rows}
+
+
+@app.get("/api/calibration")
+def calibration_endpoint(model: Optional[str] = None, horizon_days: Optional[int] = None,
+                          window_days: int = 120, recompute: bool = False,
+                          limit: int = 50) -> dict:
+    """模型校准实绩 —— 预测 vs 实际 (C4/C5, 2026-09-10).
+
+    这是系统一直缺的那一环: expectations.py 的 docstring 从 2026-05-06 起就写着
+    "攒够 3 个月再做 calibration 分析", 数据攒了 4 个月没人算, 于是两个模型带着
+    系统性偏差跑了一整季:
+      · bootstrap_v1  20d 平均高估 9.3pp, 90% 区间实际只覆盖 71.9%
+      · challenger_lgbm  训练报 OOS IC +0.049, 实际逐日截面 IC −0.288
+
+    recompute=true 会现场重算 (慢, 几秒); 否则读 model_calibration 表的历史记录。
+    """
+    from . import calibration as calib
+    if recompute:
+        out = calib.run_all(write=True, window_days=window_days)
+        return {"recomputed": True, "scored": out["scored"], "results": out["results"]}
+
+    where, params = [], []
+    if model:
+        where.append("model = ?")
+        params.append(model)
+    if horizon_days is not None:
+        where.append("horizon_days = ?")
+        params.append(int(horizon_days))
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with db.conn() as c:
+        rows = c.execute(
+            f"""SELECT computed_at, model, horizon_days, window_days, n_samples,
+                       coverage_90, coverage_50, bias_pp, sigma_ratio,
+                       rank_ic, daily_rank_ic, ic_positive_day_pct, notes
+                FROM model_calibration{where_sql}
+                ORDER BY computed_at DESC, model, horizon_days LIMIT ?""",
+            (*params, limit)).fetchall()
+    out_rows = [dict(r) for r in rows]
+    return {
+        "recomputed": False,
+        "n": len(out_rows),
+        "rows": out_rows,
+        "tolerances": {
+            "coverage_90": "90 ± 8",
+            "bias_pp": "|bias| <= 3",
+            "daily_rank_ic": "> 0 (为负 = 模型方向反了)",
+        },
+        "hint": "recompute=true 现场重算; /api/predictions 看逐条预测与实际",
+    }
+
+
+@app.get("/api/predictions")
+def predictions_endpoint(model: Optional[str] = None, symbol: Optional[str] = None,
+                          scored_only: bool = False, limit: int = 100) -> dict:
+    """逐条模型预测 + 事后实际收益 (model_predictions 表).
+
+    challenger 的预测以前只存在一个每天被覆盖的 JSON 里, 所以无法事后验证。
+    现在每天落库; 历史部分已从 76 份日报回填 (1,400 条, 其中 516 条已有实际收益)。
+    """
+    where, params = [], []
+    if model:
+        where.append("model = ?")
+        params.append(model)
+    if symbol:
+        where.append("symbol = ?")
+        params.append(symbol.upper())
+    if scored_only:
+        where.append("realized_pct IS NOT NULL")
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with db.conn() as c:
+        rows = c.execute(
+            f"""SELECT snapshot_date, model, symbol, horizon_days, pred_value,
+                       as_of, stale_days, realized_pct, scored_at
+                FROM model_predictions{where_sql}
+                ORDER BY snapshot_date DESC, model, symbol LIMIT ?""",
+            (*params, limit)).fetchall()
+    return {"n": len(rows), "rows": [dict(r) for r in rows]}
 
 
 @app.get("/api/expectations")

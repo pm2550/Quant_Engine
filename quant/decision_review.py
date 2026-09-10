@@ -18,11 +18,12 @@ log = logging.getLogger(__name__)
 
 # Direction expected from each action (1 = should go up, -1 = should go down, 0 = neutral/skip).
 ACTION_TO_EXPECTED_DIRECTION: dict[str, int] = {
+    "HOLD": 0,           # D6: HOLD 也入库了, 但不判方向对错
     "ADD": 1,
     "WATCH_BUY": 1,
     "REDUCE": -1,
     "STOP_LOSS": -1,
-    "WATCH_SKIP": -1,    # 期望: 不买后这只股没大涨 (即 <0% 或基本持平算对)
+    "WATCH_SKIP": -1,    # 仅用于聚合展示; was_correct 不再对它打分 (见 _was_correct)
     "DEFER_TO_LLM": 0,
 }
 
@@ -34,15 +35,47 @@ def _current_price(symbol: str) -> float | None:
     return float(df["close"].iloc[-1])
 
 
-def _was_correct(expected: int, return_pct: float) -> int | None:
-    """1 if direction matched. WATCH_SKIP 反着算: < +5% 算对 (avoided)."""
+def _price_on_or_after(symbol: str, when: str) -> tuple[float | None, str | None]:
+    """取 when 当日(或之后第一个交易日)的收盘价。
+
+    D7 (2026-09-10): 原来一律用"最新收盘价"。复盘是月度 timer 跑的, 所以 8 月 1 日
+    的决策实际是在 9 月 1 日按 9 月 1 日价格评分 —— 名义 30 天 horizon 变成了 31~61
+    天不定, 不同决策之间不可比。现在固定按 review_due_at 当天取价。
+    """
+    import pandas as pd
+    df = fetcher.load_local(symbol)
+    if df is None or df.empty:
+        return None, None
+    idx = pd.to_datetime(df.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    df = df.copy()
+    df.index = idx
+    df = df.sort_index()
+    pos = df.index.searchsorted(pd.Timestamp(str(when)[:10]))
+    if pos >= len(df):
+        return None, None          # 还没到期 / 价格没更新到那天
+    return float(df["close"].iloc[pos]), str(df.index[pos].date())
+
+
+# D5 (2026-09-10): 废掉 "WATCH_SKIP 涨幅 <5% 算对"。
+# 那个定义在牛市里恒为真 —— 月月报 55% 命中的同时, conviction=1 那组 30 天后
+# 实际平均涨了 +16.31% (最大踏空 PLTR +52.45%)。指标在自我恭喜。
+# 现在只对**方向性动作**判对错, 观望类不给 was_correct (记 NULL),
+# 真正的质量指标改用 rank IC —— 见 quant.calibration.calibrate_ranking。
+DIRECTIONAL_ACTIONS = {"ADD", "WATCH_BUY", "REDUCE", "STOP_LOSS"}
+
+
+def _was_correct(expected: int, return_pct: float, action: str | None = None) -> int | None:
+    """只给方向性动作判对错; 观望/持有类返回 None (不计入命中率)。"""
+    if action is not None and action not in DIRECTIONAL_ACTIONS:
+        return None
     if expected == 0:
         return None
     if expected == 1:
         return 1 if return_pct > 0 else 0
     if expected == -1:
-        # 包含 WATCH_SKIP: 不买后该股不应该大涨; 5% 以下当作 "没明显错过"
-        return 1 if return_pct < 5 else 0
+        return 1 if return_pct < 0 else 0
     return None
 
 
@@ -63,13 +96,14 @@ def run_review(*, dry_run: bool = False, push: bool = True) -> dict:
         if entry is None or entry <= 0:
             log.warning("skip %s id=%s no entry_price", sym, row["id"])
             continue
-        cur = _current_price(sym)
+        cur, priced_on = _price_on_or_after(sym, row["review_due_at"])
         if cur is None:
-            log.warning("skip %s id=%s no current price", sym, row["id"])
+            log.info("skip %s id=%s: 到期日 %s 的价格尚不可用", sym, row["id"],
+                      str(row["review_due_at"])[:10])
             continue
         return_pct = (cur - entry) / entry * 100
         expected = ACTION_TO_EXPECTED_DIRECTION.get(row["action"], 0)
-        ok = _was_correct(expected, return_pct)
+        ok = _was_correct(expected, return_pct, row["action"])
         if not dry_run:
             decision_log.mark_reviewed(row["id"], actual_return_pct=return_pct, was_correct=ok)
         by_action[row["action"]].append((row, return_pct, ok))

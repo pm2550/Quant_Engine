@@ -137,6 +137,51 @@ def render(report_data: dict) -> str:
                 lines.append(f"    {s['scenario']}: ${s['value_change']:+.0f}")
         lines.append("")
 
+    # ---- 日报压缩掉的内容改在周报出 (E4/E7, 2026-09-10) ------------------
+    # 日报从 129 行压到 ~23 行, 把完整面板搬到这里, 一周看一次就够。
+    try:
+        from . import macro_regime
+        mr = macro_regime.render_section()       # 完整面板, 不看是否变化
+        if mr:
+            lines.append(mr)
+            lines.append("")
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly macro_regime 渲染失败: %s", e)
+
+    try:
+        from .alt_data import formatter as alt_fmt
+        alt = alt_fmt.render_section()            # 完整 alt-data 块
+        if alt:
+            lines.append(alt)
+            lines.append("")
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly alt-data 渲染失败: %s", e)
+
+    # 模型校准 —— 这是以前完全没有的一环 (C4)。任何模型偏出容差都会在这里点名。
+    try:
+        from . import calibration
+        calib = calibration.render_section()
+        if calib:
+            lines.append(calib)
+            lines.append("")
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly calibration 渲染失败: %s", e)
+
+    # 价格缓存新鲜度 —— A1 的回归哨兵。曾经 159 只里 143 只冻结了好几个月没人发现。
+    try:
+        from . import price_refresh
+        rep = price_refresh.staleness_report()
+        stale = rep["total"] - rep["buckets"].get("≤2天", 0)
+        if stale > 0:
+            lines.append(f"🗂 *价格缓存*: {rep['total']} 只中 {stale} 只落后 >2 天 "
+                          f"({rep['buckets']})")
+            if rep["stale_over_30d"]:
+                names = ", ".join(f"{s}({d})" for s, d in rep["stale_over_30d"][:8])
+                lines.append(f"  ⚠️ 超 30 天: {names}")
+            lines.append("")
+    except Exception as e:  # noqa: BLE001
+        log.warning("weekly price staleness 渲染失败: %s", e)
+
     # LLM summary
     if report_data.get("llm_summary"):
         lines.append("*💡 一周总结:*")

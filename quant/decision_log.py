@@ -1,4 +1,4 @@
-"""Persist each non-HOLD recommendation so 30-day review can score accuracy.
+"""Persist每条 recommendation (含 HOLD) 供 30 天后复盘打分。
 
 Written by daily.py at end of run.
 Reviewed by decision_review.py monthly (or ad-hoc).
@@ -15,7 +15,11 @@ from . import db
 log = logging.getLogger(__name__)
 
 REVIEW_HORIZON_DAYS = 30
-LOGGABLE_ACTIONS = {"ADD", "WATCH_BUY", "REDUCE", "WATCH_SKIP", "STOP_LOSS", "DEFER_TO_LLM"}
+# D6 (2026-09-10): HOLD 原本被排除, 结果 4 个月的 392 条决策只覆盖 6 只 watchlist 标的,
+# 11 只实际持仓一条都没有 —— 而"继续持有"本身就是一个决策, 也该被复盘。更要紧的是:
+# 没有 HOLD 就没有横截面, 而 composite 唯一被证实有效的正是横截面排序 (rank IC +0.44)。
+LOGGABLE_ACTIONS = {"ADD", "WATCH_BUY", "REDUCE", "WATCH_SKIP", "STOP_LOSS",
+                    "DEFER_TO_LLM", "HOLD"}
 
 
 def log_decision(
@@ -59,7 +63,10 @@ def log_decision(
 
 
 def log_from_raw(raw: dict[str, Any]) -> dict[str, int]:
-    """Bulk-log all non-HOLD recommendations from orchestrator.run() output.
+    """Bulk-log all recommendations (HOLD included since D6) from orchestrator.run().
+
+    同时把 composite 写进 model_predictions, 让 quant.calibration 能像评估
+    challenger 一样评估 composite 的横截面预测力。
 
     Returns {'logged': N, 'skipped': M} counts.
     """
@@ -96,10 +103,40 @@ def log_from_raw(raw: dict[str, Any]) -> dict[str, int]:
                 decided_at=decided_at,
             )
             logged += 1
+            _log_composite_prediction(
+                symbol=sym, decided_at=decided_at,
+                composite=multi.get("composite_score"),
+                anchor=float(entry_price) if entry_price is not None else None,
+            )
         except Exception:
             log.exception("decision_log insert failed for %s", sym)
             skipped += 1
     return {"logged": logged, "skipped": skipped}
+
+
+def _log_composite_prediction(*, symbol: str, decided_at: datetime,
+                               composite: float | None, anchor: float | None) -> None:
+    """把 composite 当成一条"预测"存进 model_predictions, 供 calibration 统一评估。
+
+    composite 不是收益预测而是一个排序分, 但 rank IC 只关心序 —— 存原值即可。
+    """
+    if composite is None:
+        return
+    try:
+        with db.conn() as c:
+            c.execute(
+                """INSERT OR REPLACE INTO model_predictions
+                   (snapshot_date, model, symbol, horizon_days, pred_value,
+                    as_of, anchor_close, stale_days, extra_json)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (decided_at.strftime("%Y-%m-%d"), "multi_factor_composite", symbol,
+                 REVIEW_HORIZON_DAYS, float(composite),
+                 decided_at.strftime("%Y-%m-%d"), anchor, 0,
+                 json.dumps({"note": "composite is a rank score, not a return forecast"},
+                            ensure_ascii=False)),
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("model_predictions insert failed for %s", symbol)
 
 
 def pending_reviews(now: datetime | None = None) -> list[sqlite3.Row]:

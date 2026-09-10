@@ -327,6 +327,39 @@ def _log_audit(*, task: str | None, backend: str, success: bool,
 # ---- Public chat / embed API ----
 
 
+# ---- Rate-limit handling (B2, 2026-09-10) ----------------------------------
+# Ollama Cloud 的所有路由共享同一份配额, 所以 429 时"跳到下一个 backend"毫无用处
+# (下一个也是 ollama, 同样 429) —— 近 30 天因此产生 183 次 429 / simple_chat 31% 失败率.
+# 改成: 同一 backend 先指数退避重试, 连续被限流则进入冷却期, 期间直接跳过不再打。
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_S = (2.0, 6.0, 15.0)     # 第 n 次重试前 sleep
+RATE_LIMIT_COOLDOWN_S = 180.0               # 退避耗尽后该 backend 冷却时长
+_COOLDOWN_UNTIL: dict[str, float] = {}
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """429 / quota / rate limit —— 跨 provider 的字符串嗅探 (各家措辞不一)。"""
+    t = repr(exc).lower()
+    return ("429" in t or "too many requests" in t
+            or "rate limit" in t or "quota" in t)
+
+
+def _cooling(backend: str) -> float:
+    """返回剩余冷却秒数 (0 = 可用)。"""
+    until = _COOLDOWN_UNTIL.get(backend, 0.0)
+    return max(0.0, until - time.time())
+
+
+def _enter_cooldown(backend: str, seconds: float = RATE_LIMIT_COOLDOWN_S) -> None:
+    _COOLDOWN_UNTIL[backend] = time.time() + seconds
+    log.warning("backend %s rate-limited; cooling down %.0fs", backend, seconds)
+
+
+def rate_limit_state() -> dict[str, float]:
+    """给 smoke_test / /api/audit 用: 当前处于冷却中的 backend 及剩余秒数。"""
+    return {b: round(_cooling(b), 1) for b in _COOLDOWN_UNTIL if _cooling(b) > 0}
+
+
 def chat(
     prompt: str | list[dict],
     *,
@@ -368,48 +401,69 @@ def chat(
             log.warning("provider %s not configured, skipping", provider_name)
             continue
 
+        cool = _cooling(entry)
+        if cool > 0:
+            log.info("backend %s in rate-limit cooldown (%.0fs left), skipping", entry, cool)
+            continue
+
         kwargs = {"max_tokens": max_tokens, "temperature": temperature, "timeout": timeout}
         if response_format == "json":
             kwargs["response_format"] = "json"
         if disable_thinking:
             kwargs["disable_thinking"] = True
-        t0 = time.time()
-        try:
-            out = provider.chat(model, messages, **kwargs)
-            elapsed = round(time.time() - t0, 2)
-            out["wall_time_s"] = elapsed
-            out["task"] = task
-            text = out.get("text", "") or ""
-            if not text.strip():
-                # Some thinking-mode models emit content="" when budget exhausted by thinking.
-                think = (out.get("thinking") or "").strip()
-                if think:
-                    log.info("backend %s returned empty content, salvaging thinking field", entry)
-                    out["text"] = think
-                    _log_audit(task=task, backend=entry, success=True,
-                                wall_time_s=elapsed,
-                                tokens_in=out.get("tokens_in", 0),
-                                tokens_out=out.get("tokens_out", 0),
-                                prompt_chars=prompt_chars,
-                                response_chars=len(think),
-                                caller=caller_name)
-                    return out
-                raise RuntimeError(f"empty content from {entry}")
-            _log_audit(task=task, backend=entry, success=True,
-                        wall_time_s=elapsed,
-                        tokens_in=out.get("tokens_in", 0),
-                        tokens_out=out.get("tokens_out", 0),
-                        prompt_chars=prompt_chars,
-                        response_chars=len(text),
-                        caller=caller_name)
-            return out
-        except Exception as e:  # noqa: BLE001
-            elapsed = round(time.time() - t0, 2)
-            _log_audit(task=task, backend=entry, success=False,
-                        wall_time_s=elapsed, prompt_chars=prompt_chars,
-                        error=repr(e)[:500], caller=caller_name)
-            last_err = e
-            log.warning("backend %s failed (%s), trying next", entry, e)
+
+        # 同一 backend 内的 429 退避重试 (非 429 错误不重试, 直接 fallback 下一个)
+        attempt = 0
+        while True:
+            t0 = time.time()
+            try:
+                out = provider.chat(model, messages, **kwargs)
+                elapsed = round(time.time() - t0, 2)
+                out["wall_time_s"] = elapsed
+                out["task"] = task
+                text = out.get("text", "") or ""
+                if not text.strip():
+                    # Some thinking-mode models emit content="" when budget exhausted by thinking.
+                    think = (out.get("thinking") or "").strip()
+                    if think:
+                        log.info("backend %s returned empty content, salvaging thinking field", entry)
+                        out["text"] = think
+                        _log_audit(task=task, backend=entry, success=True,
+                                    wall_time_s=elapsed,
+                                    tokens_in=out.get("tokens_in", 0),
+                                    tokens_out=out.get("tokens_out", 0),
+                                    prompt_chars=prompt_chars,
+                                    response_chars=len(think),
+                                    caller=caller_name)
+                        return out
+                    raise RuntimeError(f"empty content from {entry}")
+                _log_audit(task=task, backend=entry, success=True,
+                            wall_time_s=elapsed,
+                            tokens_in=out.get("tokens_in", 0),
+                            tokens_out=out.get("tokens_out", 0),
+                            prompt_chars=prompt_chars,
+                            response_chars=len(text),
+                            caller=caller_name)
+                return out
+            except Exception as e:  # noqa: BLE001
+                elapsed = round(time.time() - t0, 2)
+                limited = _is_rate_limited(e)
+                _log_audit(task=task, backend=entry, success=False,
+                            wall_time_s=elapsed, prompt_chars=prompt_chars,
+                            error=repr(e)[:500], caller=caller_name)
+                last_err = e
+                if limited and attempt < RATE_LIMIT_RETRIES:
+                    wait = RATE_LIMIT_BACKOFF_S[min(attempt, len(RATE_LIMIT_BACKOFF_S) - 1)]
+                    attempt += 1
+                    log.warning("backend %s rate-limited, retry %d/%d after %.0fs",
+                                entry, attempt, RATE_LIMIT_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                if limited:
+                    # 退避用尽 —— 冷却这个 backend, 让后续请求直接跳过它
+                    _enter_cooldown(entry)
+                log.warning("backend %s failed (%s), trying next", entry, e)
+                break
 
     raise RuntimeError(f"all backends in chain {chain} failed: {last_err}")
 

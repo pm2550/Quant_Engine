@@ -26,13 +26,15 @@ rss_feeds:
     url: http://feeds.bbci.co.uk/news/world/rss.xml
     region: global
     weight: 0.8
-    fetch_interval_seconds: 900
+    max_items_per_poll: 12      # A3: 近60天 2,446 条
+    fetch_interval_seconds: 1200
 
   - name: aljazeera
     url: https://www.aljazeera.com/xml/rss/all.xml
     region: global
     weight: 0.6
-    fetch_interval_seconds: 1200
+    max_items_per_poll: 10      # A3: 近60天刷了 5,126 条, 淹没半导体专业源
+    fetch_interval_seconds: 1800
 
   # 美国政策/经济
   - name: fed_press
@@ -57,7 +59,8 @@ rss_feeds:
     url: https://feeds.feedburner.com/zerohedge/feed
     region: us
     weight: 0.5    # 立场偏激, 但快, 当先行指标
-    fetch_interval_seconds: 600
+    max_items_per_poll: 8       # A3: 近60天 3,568 条, 且 10min 一轮
+    fetch_interval_seconds: 900
 
   # 中国政策/财经
   - name: xinhua_politics
@@ -90,7 +93,7 @@ rss_feeds:
   - name: tomshardware_news
     url: https://www.tomshardware.com/feeds/all
     region: global
-    weight: 1.0
+    weight: 1.5
     fetch_interval_seconds: 1800
     notes: "Tom's Hardware — GPU 评测 / 供应链 / 价格趋势"
 
@@ -108,10 +111,12 @@ rss_feeds:
     fetch_interval_seconds: 1800
     notes: "The Register Data Centre — hyperscaler/AI infra 新闻"
 
+  # A3: 以下半导体/数据中心源是持仓 (SOXX/AVGO/AMKR/ARM/QCOM/DRAM/VRT) 的直接相关源,
+  # 之前被通用时政源以 11:1 淹没。提权到 1.5 让每轮多取, 同时压低通用源上限。
   - name: semiconductor_engineering
     url: https://semiengineering.com/feed/
     region: global
-    weight: 1.0
+    weight: 1.5
     fetch_interval_seconds: 3600
     notes: "Semiconductor Engineering — 封装 / CoWoS / HBM 产能新闻"
 

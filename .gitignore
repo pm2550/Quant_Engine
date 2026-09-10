@@ -62,3 +62,12 @@ models/
 
 # EDGAR fundamentals cache (~400MB, refreshed quarterly)
 data/edgar/
+
+# 行情/宏观缓存 (402 MB parquet) —— 可从 yfinance/akshare 重建, 不进仓库
+data/prices/
+data/macro/
+data/news/
+data/edgar/
+
+# 已废弃配置的备份 (2026-06-02 dashscope 下线)
+config/llm.yaml.bak-*

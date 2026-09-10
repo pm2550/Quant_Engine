@@ -61,18 +61,32 @@ def _split_params(params: dict) -> tuple[dict, str | None]:
     return params, None
 
 
+def _finite(x, default: float = 0.0) -> float:
+    """NaN 和 ±Inf 都归零。
+
+    D2 (2026-09-10): 原来只挡 NaN。0 笔交易时 vectorbt 的收益序列方差为 0,
+    sharpe_ratio() 返回 +Inf, 于是 11,251 条"零交易"记录以 sharpe=Inf 存进库,
+    坐在每个 ORDER BY sharpe DESC 的最顶上。
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) else default
+
+
 def _metrics(pf: vbt.Portfolio) -> dict:
     stats = pf.stats()
-    sharpe = float(pf.sharpe_ratio()) if not np.isnan(pf.sharpe_ratio()) else 0.0
-    sortino = float(pf.sortino_ratio()) if not np.isnan(pf.sortino_ratio()) else 0.0
-    total_ret = float(pf.total_return())
+    sharpe = _finite(pf.sharpe_ratio())
+    sortino = _finite(pf.sortino_ratio())
+    total_ret = _finite(pf.total_return())
     n_years = (pf.wrapper.index[-1] - pf.wrapper.index[0]).days / 365.25
     annual = float(((1 + total_ret) ** (1 / max(n_years, 0.001))) - 1) if total_ret > -1 else -1.0
-    mdd = float(pf.max_drawdown())
+    mdd = _finite(pf.max_drawdown())
     trades = pf.trades
     n_trades = int(trades.count())
-    win_rate = float(trades.win_rate()) if n_trades else 0.0
-    pf_ratio = float(trades.profit_factor()) if n_trades and not np.isnan(trades.profit_factor()) else 0.0
+    win_rate = _finite(trades.win_rate()) if n_trades else 0.0
+    pf_ratio = _finite(trades.profit_factor()) if n_trades else 0.0
     return {
         "total_return": total_ret,
         "annual_return": annual,

@@ -32,6 +32,15 @@ TICKERS = {
     "JPY=X":    "usdjpy.parquet",    # USDJPY — yen carry / risk-off barometer
 }
 
+# 汇率序列: 只用于组合权重换算 (orchestrator.fx_to_usd), **不是** ML 特征。
+# E3 (2026-09-10) 最初把 CNY=X 直接塞进 TICKERS, 结果 load_macro_features 把它当
+# 特征列去取 df["CNY=X"] 而缓存文件的列名是 "close" → KeyError 打挂 challenger 推理。
+# 而且广播型宏观变量做 per-symbol 特征会破坏截面 IC (见 2026-06-01 的 v6_fred ablation:
+# median_ic 0.066 → 0.011), 所以汇率本来就不该进特征矩阵。
+FX_TICKERS = {
+    "CNY=X": "usdcny.parquet",
+}
+
 # FRED series id → cache filename; downloaded as CSV without auth via fredgraph URL
 FRED_SERIES = {
     "DFF":      "fred_dff.parquet",       # Federal Funds Rate (daily, effective)
@@ -52,8 +61,8 @@ def refresh_all(force: bool = False) -> dict[str, int]:
     out = {}
     start = date.today() - timedelta(days=365 * LOOKBACK_YEARS)
 
-    # 1. yfinance index tickers (VIX, yields, DXY, gold, oil, USDJPY)
-    for ticker, fname in TICKERS.items():
+    # 1. yfinance index tickers (VIX, yields, DXY, gold, oil, USDJPY) + 汇率
+    for ticker, fname in {**TICKERS, **FX_TICKERS}.items():
         p = CACHE / fname
         if p.exists() and not force:
             existing = pd.read_parquet(p)
@@ -126,7 +135,7 @@ def load_macro_features() -> pd.DataFrame:
       VIX_X_Y10 (regime interaction)
     """
     series = {}
-    for ticker, fname in TICKERS.items():
+    for ticker, fname in TICKERS.items():       # 刻意不含 FX_TICKERS
         p = CACHE / fname
         if not p.exists():
             continue
@@ -134,7 +143,17 @@ def load_macro_features() -> pd.DataFrame:
         if df.empty:
             continue
         df.index = pd.to_datetime(df.index)
-        series[ticker] = df[ticker]
+        # 列名容错: 老缓存用 ticker 名, 新抓的可能是 "close" —— 缺列就跳过而不是抛,
+        # 否则一个格式不一致的缓存文件会打挂整条 challenger 推理链。
+        if ticker in df.columns:
+            series[ticker] = df[ticker]
+        elif "close" in df.columns:
+            series[ticker] = df["close"]
+        elif len(df.columns) == 1:
+            series[ticker] = df.iloc[:, 0]
+        else:
+            log.warning("macro 缓存 %s 没有可用列 (有 %s), 跳过", fname, list(df.columns))
+            continue
     if not series:
         return pd.DataFrame()
 
