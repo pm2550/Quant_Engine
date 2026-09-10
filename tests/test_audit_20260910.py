@@ -580,3 +580,45 @@ class TestChallengerTrainingGuards:
         from quant.ml import serve
         line = serve.live_performance_line()
         assert "尚无校准记录" in line or "失败" in line
+
+
+# ---------------------------------------------------------------- G1
+class TestAudioPromptRendering:
+    """G1 (部署重启时发现): audio_queue 310/310 任务全部失败, 子系统从未成功过一次。
+
+    ANALYZE_PROMPT 里有一大段 JSON 示例的裸大括号, 而渲染用的是 str.format() ——
+    format 把 `{\\n  "summary": ...` 当成占位符名, 每次必抛 KeyError。异常被
+    per-task try/except 吞进 audio_queue.error, 所以对外表现只是"日报里的音频
+    要点那段从不出现"。每条还照样先花 6 分钟跑 whisper 转写才在最后一步炸掉。
+    """
+
+    def test_prompt_renders_without_error(self):
+        from string import Template
+        from quant import audio_queue_worker as W
+        out = Template(W.ANALYZE_PROMPT).safe_substitute(
+            portfolio="AMD(AMD), VOO(Vanguard)", source="wsj_markets", title="T")
+        assert "AMD(AMD)" in out
+        assert "wsj_markets" in out
+
+    def test_json_example_survives_rendering(self):
+        """JSON 示例必须原样保留 —— 它是给 LLM 看的输出格式说明。"""
+        from string import Template
+        from quant import audio_queue_worker as W
+        out = Template(W.ANALYZE_PROMPT).safe_substitute(
+            portfolio="X", source="s", title="t")
+        for key in ('"summary"', '"impacts"', '"importance"', '"tone"'):
+            assert key in out, f"JSON 示例里的 {key} 丢了"
+
+    def test_no_unresolved_placeholders(self):
+        from string import Template
+        from quant import audio_queue_worker as W
+        out = Template(W.ANALYZE_PROMPT).safe_substitute(
+            portfolio="X", source="s", title="t")
+        for ph in ("$portfolio", "$source", "$title", "{portfolio}", "{source}", "{title}"):
+            assert ph not in out, f"占位符 {ph} 没被替换"
+
+    def test_format_would_still_break(self):
+        """钉住根因: 换回 str.format 一定炸 —— 防止有人"顺手改回去"。"""
+        from quant import audio_queue_worker as W
+        with pytest.raises((KeyError, IndexError, ValueError)):
+            W.ANALYZE_PROMPT.format(portfolio="X", source="s", title="t")

@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import sqlite3
+from string import Template
 import time
 from datetime import datetime
 
@@ -26,6 +27,14 @@ log = logging.getLogger(__name__)
 
 API_BASE = "http://172.17.0.1:7900"
 
+# G1 (2026-09-10): 原来这里用 str.format(portfolio=..., source=..., title=...) 渲染,
+# 而 prompt 里有一大段 JSON 示例的裸大括号 —— format 把 `{\n  "summary": ...` 当成了
+# 占位符名, 于是每次都抛 KeyError: '\n  "summary"'。
+# 后果: audio_queue 310 个任务 **全部** 失败 (status=failed, 310/310), 整个音频分析
+# 子系统从来没成功过一次; 日报模板里的 "🎙️ 昨晚音频要点" 那段因此从不出现。
+# 又是一个不报错到用户面前的静默失效 —— 转写照样跑 (每条花 6 分钟 whisper), 只是
+# 分析一步必然抛异常, 而异常被 per-task try/except 吞进 audio_queue.error 字段。
+# 改用 string.Template ($-占位符): JSON 大括号不再有特殊含义, 从根上消掉这类雷。
 ANALYZE_PROMPT = """你是金融研究员。给定音频文字稿 + 主人持仓, 输出 JSON:
 
 {
@@ -38,9 +47,9 @@ ANALYZE_PROMPT = """你是金融研究员。给定音频文字稿 + 主人持仓
   "importance": 0-10
 }
 
-主人持仓: {portfolio}
-音频来源: {source}
-音频标题: {title}
+主人持仓: $portfolio
+音频来源: $source
+音频标题: $title
 
 注意:
 - impacts 中 symbol 严格限于上方持仓列表
@@ -107,7 +116,9 @@ def _transcribe_via_api(audio_url: str) -> dict:
 
 
 def _analyze(transcript: str, source: str, title: str) -> dict:
-    prompt = ANALYZE_PROMPT.format(portfolio=_portfolio_str(), source=source, title=title)
+    # safe_substitute 而非 substitute: prompt 里未来若再多一个 $ 符号也不会炸
+    prompt = Template(ANALYZE_PROMPT).safe_substitute(
+        portfolio=_portfolio_str(), source=source, title=title)
     user_msg = transcript[:30000]  # cap to fit context
     return llm_router.chat_json(
         user_msg, task="reasoning", system=prompt,
