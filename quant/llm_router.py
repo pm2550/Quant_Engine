@@ -97,12 +97,33 @@ class OpenAICompatProvider(Provider):
         )
         r.raise_for_status()
         data = r.json()
-        return {
-            "text": (data["choices"][0]["message"].get("content") or ""),
-            "tokens_in": data.get("usage", {}).get("prompt_tokens", 0),
-            "tokens_out": data.get("usage", {}).get("completion_tokens", 0),
+        msg = data["choices"][0]["message"]
+        usage = data.get("usage") or {}
+        out = {
+            "text": (msg.get("content") or ""),
+            "tokens_in": usage.get("prompt_tokens", 0),
+            "tokens_out": usage.get("completion_tokens", 0),
             "backend": f"{self.name}:{model}",
         }
+        # 2026-09-11: thinking-mode 模型把思考放在独立字段 —— 各家命名不一
+        # (nano-gpt 用 "reasoning", dashscope/其它用 "reasoning_content")。
+        # 不暴露出来的话, content 为空时 chat() 只能判"空回复"直接 fallback,
+        # 白扔一次已经付过钱的调用。
+        for key in ("reasoning", "reasoning_content", "thinking"):
+            val = msg.get(key)
+            if val:
+                out["thinking"] = val if isinstance(val, str) else str(val)
+                break
+        # provider 自报的真实花费优先于本地价格表估算 (nano-gpt 在 usage 里带
+        # cost/currency)。付费 provider 上"估算"没有意义, 实报才能对账。
+        cost = usage.get("cost")
+        if cost is not None:
+            try:
+                out["cost_usd_reported"] = float(cost)
+                out["cost_currency"] = usage.get("currency", "USD")
+            except (TypeError, ValueError):
+                pass
+        return out
 
 
 class OllamaProvider(Provider):
@@ -306,15 +327,22 @@ def _log_audit(*, task: str | None, backend: str, success: bool,
                 wall_time_s: float | None = None,
                 tokens_in: int = 0, tokens_out: int = 0,
                 prompt_chars: int = 0, response_chars: int = 0,
-                error: str | None = None, caller: str | None = None) -> None:
-    """Best-effort write to llm_audit table. Lazy-imports db to avoid circular issues."""
+                error: str | None = None, caller: str | None = None,
+                cost_usd_reported: float | None = None) -> None:
+    """Best-effort write to llm_audit table. Lazy-imports db to avoid circular issues.
+
+    cost_usd_reported: provider 在响应里自报的真实花费 (nano-gpt 等付费 provider)。
+    给了就用它, 否则回落到 config/llm_routes.yaml 的本地价格表估算。
+    """
     try:
         from quant import db
+        cost = (cost_usd_reported if cost_usd_reported is not None
+                else _estimate_cost(backend, tokens_in, tokens_out))
         db.log_llm_call(
             task=task, backend=backend, success=success,
             wall_time_s=wall_time_s,
             tokens_in=tokens_in or None, tokens_out=tokens_out or None,
-            cost_usd=_estimate_cost(backend, tokens_in, tokens_out),
+            cost_usd=cost,
             caller=caller or _detect_caller(),
             prompt_chars=prompt_chars or None,
             response_chars=response_chars or None,
@@ -447,7 +475,8 @@ def chat(
                                     tokens_out=out.get("tokens_out", 0),
                                     prompt_chars=prompt_chars,
                                     response_chars=len(think),
-                                    caller=caller_name)
+                                    caller=caller_name,
+                                    cost_usd_reported=out.get("cost_usd_reported"))
                         return out
                     raise RuntimeError(f"empty content from {entry}")
                 _log_audit(task=task, backend=entry, success=True,
@@ -456,7 +485,8 @@ def chat(
                             tokens_out=out.get("tokens_out", 0),
                             prompt_chars=prompt_chars,
                             response_chars=len(text),
-                            caller=caller_name)
+                            caller=caller_name,
+                            cost_usd_reported=out.get("cost_usd_reported"))
                 return out
             except Exception as e:  # noqa: BLE001
                 elapsed = round(time.time() - t0, 2)

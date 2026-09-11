@@ -777,3 +777,94 @@ class TestQuarantineRegistry:
         from quant import task_generator as T
         import inspect
         assert "wf_prio" in inspect.getsource(T.walk_forward)
+
+
+# ---------------------------------------------------------------- H1 (2026-09-11)
+class TestNanoGptFallback:
+    """H1: 给每条 route 加 nano-gpt 作为跨 provider fallback。
+
+    为什么必须跨 provider: Ollama Cloud 的所有 route 共享同一份配额, 打满时
+    "fallback 到同一家的另一个模型"毫无用处 —— 近 30 天 183 次 429, simple_chat
+    失败率曾到 31%, 因为整条链都在同一个配额池里。
+    (接入当天实测: Ollama 正在 429, 所有请求直接落到 nano-gpt 才没失败。)
+    """
+
+    def test_provider_registered(self):
+        from quant import config as cfg_mod
+        providers = cfg_mod.load("llm_routes").get("providers") or {}
+        assert "nanogpt" in providers
+        p = providers["nanogpt"]
+        assert p["type"] == "openai_compat"
+        # 必须用环境变量引用, 绝不能把 key 写进这个**公开仓库**的 yaml
+        assert p.get("api_key_env") == "NANOGPT_API_KEY"
+        assert "sk-" not in str(p), "key 泄漏进 llm_routes.yaml 了"
+
+    def test_every_route_has_cross_provider_fallback(self):
+        """每条 route 至少要有两个不同 provider —— 否则单家故障就全断。"""
+        from quant import config as cfg_mod
+        routes = cfg_mod.load("llm_routes").get("routes") or {}
+        assert routes
+        for task, chain in routes.items():
+            providers = {e.split(":", 1)[0] for e in chain}
+            assert len(providers) >= 2, f"route {task} 只有一个 provider: {providers}"
+            assert "nanogpt" in providers, f"route {task} 没挂 nano-gpt fallback"
+
+    def test_short_output_routes_have_no_thinking_models(self):
+        """需要快/短输出的 route 不能挂 thinking 模型。
+
+        实测踩到: fast_reasoning 原挂 z-ai/glm-5.3-flash (thinking 模型),
+        max_tokens=60 时思考吃光预算 → content 空 → llm_router 的"抢救 thinking"
+        兜底把整段思考当答案返回 ("The user is asking...")。
+        """
+        from quant import config as cfg_mod
+        routes = cfg_mod.load("llm_routes").get("routes") or {}
+        SHORT = ("simple_chat", "format", "fast_reasoning")
+        KNOWN_THINKING = ("thinking", "glm-5.3-flash")
+        for task in SHORT:
+            for entry in routes.get(task, []):
+                low = entry.lower()
+                for bad in KNOWN_THINKING:
+                    assert bad not in low, f"route {task} 挂了 thinking 模型 {entry}"
+
+    def test_thinking_models_only_in_deep_routes(self):
+        from quant import config as cfg_mod
+        routes = cfg_mod.load("llm_routes").get("routes") or {}
+        for task in ("deep_reasoning", "review"):
+            chain = routes.get(task, [])
+            assert any("thinking" in e.lower() for e in chain), \
+                f"route {task} 应该用 thinking 模型"
+
+    def test_no_deepseek_anywhere(self):
+        """主人明确不用 deepseek (幻觉严重) —— nano-gpt 上有 deepseek 模型, 别误选。"""
+        from quant import config as cfg_mod
+        cfg = cfg_mod.load("llm_routes")
+        for task, chain in (cfg.get("routes") or {}).items():
+            for entry in chain:
+                assert "deepseek" not in entry.lower(), f"route {task} 选了 deepseek: {entry}"
+
+    def test_provider_surfaces_reasoning_as_thinking(self):
+        """nano-gpt 把思考放在 `reasoning` 字段 (不是 reasoning_content)。
+        不暴露出来的话 content 为空时只能判"空回复"白扔一次已付费的调用。
+        """
+        from quant.llm_router import OpenAICompatProvider
+        import inspect
+        src = inspect.getsource(OpenAICompatProvider.chat)
+        assert '"reasoning"' in src
+        assert '"thinking"' in src
+
+    def test_provider_surfaces_reported_cost(self):
+        """nano-gpt 在 usage 里自报真实 cost —— 付费 provider 上本地价格表估算没意义。"""
+        from quant.llm_router import OpenAICompatProvider
+        import inspect
+        assert "cost_usd_reported" in inspect.getsource(OpenAICompatProvider.chat)
+
+    def test_audit_prefers_reported_cost(self):
+        from quant import llm_router as R
+        import inspect
+        assert "cost_usd_reported" in inspect.signature(R._log_audit).parameters
+
+    def test_nanogpt_not_in_local_price_table(self):
+        """不该给它写死价格 —— 294 个模型且会变价, 用实报值。"""
+        from quant import config as cfg_mod
+        costs = cfg_mod.load("llm_routes").get("costs") or {}
+        assert not any(k.startswith("nanogpt:") for k in costs)

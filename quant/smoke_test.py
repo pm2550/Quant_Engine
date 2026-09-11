@@ -109,13 +109,31 @@ def _():
 
 @check("ollama-cloud reachable")
 def _():
-    # Post-config-driven refactor: read from llm_routes.yaml provider env, not module attr.
+    """直接打 ollama provider, 不经过 route 链。
+
+    2026-09-11: 原来这里是 `chat(task="reasoning")` 然后断言 backend 以 "ollama:" 开头。
+    加了 nano-gpt 跨 provider fallback 之后, Ollama 限流时链路会正确地落到 nano-gpt ——
+    于是这条检查开始失败, 而"fallback 生效"恰恰是我们想要的行为。
+    检查单个 provider 的可达性就该绕开 fallback 链, 否则它测的是"谁兜底"而不是"谁可达"。
+    限流不算挂 (配额打满是常态, 链路已能接住), 只告警。
+    """
     import os
     if not os.environ.get("OLLAMA_CLOUD_KEY"):
         warn("OLLAMA_CLOUD_KEY not set")
         return
-    out = llm_router.chat("say ok", task="reasoning", max_tokens=30, timeout=60)
-    assert out["backend"].startswith("ollama:"), f"unexpected backend: {out['backend']}"
+    provider = llm_router._providers().get("ollama")
+    if provider is None:
+        warn("ollama provider 未配置")
+        return
+    try:
+        out = provider.chat("glm-5.1", [{"role": "user", "content": "say ok"}],
+                             max_tokens=30, timeout=60)
+        assert out.get("text") or out.get("thinking"), "ollama 返回空"
+    except Exception as e:  # noqa: BLE001
+        if llm_router._is_rate_limited(e):
+            warn(f"ollama-cloud 限流中 (配额打满, nano-gpt 会接住): {repr(e)[:80]}")
+            return
+        raise
 
 
 @check("gemini embeddings reachable")
@@ -255,6 +273,44 @@ def _():
     st = llm_router.rate_limit_state()
     if st:
         warn(f"以下 backend 正在限流冷却中: {st}")
+
+
+@check("H1: 每条 LLM route 都有跨 provider fallback")
+def _():
+    """2026-09-11: Ollama Cloud 所有 route 共享同一份配额, 打满时"fallback 到同一家
+    的另一个模型"毫无用处 —— 整条链会一起 429。每条 route 必须至少跨两家。
+    """
+    routes = cfg_mod.load("llm_routes").get("routes") or {}
+    assert routes, "没有任何 route 配置"
+    single = []
+    for task, chain in routes.items():
+        if len({e.split(":", 1)[0] for e in chain}) < 2:
+            single.append(task)
+    assert not single, f"以下 route 只有单一 provider, 该家故障就全断: {single}"
+
+
+@check("H1b: nano-gpt 可达 (付费 fallback)")
+def _():
+    import os
+    if not os.environ.get("NANOGPT_API_KEY"):
+        warn("NANOGPT_API_KEY 未设置 — 所有 route 会退回单 provider")
+        return
+    out = llm_router.chat("回复 OK", task="simple_chat", max_tokens=60, timeout=90)
+    assert out.get("text"), "simple_chat 链全部失败"
+
+
+@check("H1c: LLM 近 7 天花费")
+def _():
+    """nano-gpt 是付费的。实报 cost 已写入 llm_audit, 这里盯着别悄悄烧钱。"""
+    with sqlite3.connect(db.DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT ROUND(SUM(COALESCE(cost_usd,0)), 4), COUNT(*) FROM llm_audit "
+            "WHERE ts >= date('now','-7 day') AND backend LIKE 'nanogpt:%'").fetchone()
+    cost, n = (row[0] or 0.0), (row[1] or 0)
+    if n:
+        print(f"   nano-gpt 近 7 天: {n} 次调用, ${cost}")
+    if cost > 5.0:
+        warn(f"nano-gpt 近 7 天花费 ${cost} — 超过 $5, 检查是不是 Ollama 一直在 429")
 
 
 # ===== 6. Systemd services =====

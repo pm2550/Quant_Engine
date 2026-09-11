@@ -25,6 +25,17 @@ providers:
     base_url_env: OLLAMA_CLOUD_BASE   # 默认 https://ollama.com
     api_key_env: OLLAMA_CLOUD_KEY
     default_timeout: 240
+  # nano-gpt (2026-09-11): OpenAI 兼容聚合站, 294 个模型, 作为每条 route 的第二/第三
+  # 落点。加它的原因: Ollama Cloud 的所有 route 共享同一份配额, 打满时 429 会让整条
+  # 链一起失败 (近 30 天 183 次 429, simple_chat 失败率曾 31%) —— 同一家的 fallback
+  # 不是 fallback。nano-gpt 是独立配额/独立计费, 才真能接住。
+  # ⚠️ 付费: usage 里自报 cost, llm_router 已改为优先用实报值写 llm_audit,
+  #    查花费: GET /api/audit 或 db.llm_audit_summary(days=N)
+  nanogpt:
+    type: openai_compat
+    base_url_env: NANOGPT_BASE        # https://nano-gpt.com/api/v1
+    api_key_env: NANOGPT_API_KEY
+    default_timeout: 180
   gemini:
     type: gemini_embed
     api_key_env: GEMINI_API_KEY
@@ -32,18 +43,42 @@ providers:
 
 # task → provider:model chain. 第一个成功即返回, 失败链式 fallback.
 routes:
+  # 每条链的结构: ollama (免费, 但所有 route 共享同一份配额) → nanogpt (付费, 独立配额)。
+  # 2026-09-11 加 nano-gpt 的原因: Ollama Cloud 打满配额时, "fallback 到同一家的另一个
+  # 模型"毫无用处 —— 近 30 天 183 次 429, simple_chat 失败率曾到 31%, 因为整条链都在
+  # 同一个配额池里。真正的 fallback 必须跨 provider。
+  #
+  # nano-gpt 侧刻意选**同名同族**模型, 保证 fallback 后行为不漂:
+  #   ollama:kimi-k2.6        → nanogpt:moonshotai/kimi-k2.6       (完全同名)
+  #   ollama:glm-5.1          → nanogpt:z-ai/glm-5.1              (完全同名)
+  #   ollama:kimi-k2-thinking → nanogpt:moonshotai/kimi-k2-thinking (完全同名)
+  #   ollama:qwen3-coder-next → nanogpt:qwen/qwen3-coder-next     (完全同名)
+  #   ollama:qwen3-vl:235b    → nanogpt:qwen25-vl-72b-instruct    (同为 Qwen-VL 系)
+  # nano-gpt 用模型名后缀 (:thinking) 区分思考模式, 不是请求参数 —— 所以需要干净输出的
+  # route (format/simple_chat) 只挂非 :thinking 变体, 只有 deep_reasoning / review 用它。
+  # 以上每个模型在 2026-09-11 都单独发过真实请求验证可调通。
+  #
+  # ⚠️ thinking 模型 + 小 max_tokens = 陷阱。实测踩到: fast_reasoning 原本挂
+  #    z-ai/glm-5.3-flash (它是 thinking 模型), max_tokens=60 时思考就吃光预算 →
+  #    content 为空 → llm_router 的 "抢救 thinking 字段" 兜底把整段思考当答案返回
+  #    ("The user is asking..."). 给到 300 token 它就正常输出"可用"了。
+  #    所以: 需要快/短输出的 route 只挂**真的不带 thinking** 的模型 (响应里没有
+  #    reasoning 字段), 已实测 glm-4.7-flash 和 qwen3.8-flash 属于这类;
+  #    glm-5.3-flash / *:thinking / kimi-k2-thinking 只放进 deep_reasoning 和 review
+  #    (那两条的调用点给的预算足够)。
+  #
   # ⚠️ dashscope (qwen coding plan, coding.dashscope.aliyuncs.com) 于 2026-06-01 过期下线.
   #    全部改走 ollama cloud. 主模型 = kimi-k2.6 (256k, 带视觉); format 用 glm-5.1 打头 (轻/出 JSON 稳).
-  simple_chat:    [ollama:kimi-k2.6, ollama:glm-5.1]
-  format:         [ollama:glm-5.1, ollama:kimi-k2.6]
-  reasoning:      [ollama:glm-5.1, ollama:kimi-k2.6]
-  deep_reasoning: [ollama:kimi-k2-thinking, ollama:glm-5.1, ollama:kimi-k2.6]
-  fast_reasoning: [ollama:glm-5.1, ollama:kimi-k2.6]
-  long_context:   [ollama:kimi-k2.6, ollama:glm-5.1]   # k2.6 = 256k ctx
-  code:           [ollama:qwen3-coder-next, ollama:glm-5.1]
-  agentic:        [ollama:kimi-k2.6, ollama:glm-5.1]
-  review:         [ollama:kimi-k2-thinking, ollama:glm-5.1]
-  vision:         [ollama:kimi-k2.6, ollama:qwen3-vl:235b]
+  simple_chat:    [ollama:kimi-k2.6, nanogpt:moonshotai/kimi-k2.6, nanogpt:z-ai/glm-5.1]
+  format:         [ollama:glm-5.1, nanogpt:z-ai/glm-5.1, nanogpt:moonshotai/kimi-k2.6]
+  reasoning:      [ollama:glm-5.1, nanogpt:z-ai/glm-5.1, nanogpt:moonshotai/kimi-k2.6]
+  deep_reasoning: [ollama:kimi-k2-thinking, nanogpt:moonshotai/kimi-k2-thinking, nanogpt:z-ai/glm-5.1:thinking, ollama:glm-5.1]
+  fast_reasoning: [ollama:glm-5.1, nanogpt:z-ai/glm-4.7-flash, nanogpt:alibaba/qwen3.8-flash]
+  long_context:   [ollama:kimi-k2.6, nanogpt:moonshotai/kimi-k2.6, nanogpt:z-ai/glm-5.1]   # k2.6 = 256k ctx
+  code:           [ollama:qwen3-coder-next, nanogpt:qwen/qwen3-coder-next, nanogpt:moonshotai/kimi-k2.7-code]
+  agentic:        [ollama:kimi-k2.6, nanogpt:moonshotai/kimi-k2.6, nanogpt:z-ai/glm-5.1]
+  review:         [ollama:kimi-k2-thinking, nanogpt:moonshotai/kimi-k2-thinking, nanogpt:z-ai/glm-5.1:thinking]
+  vision:         [ollama:kimi-k2.6, nanogpt:moonshotai/kimi-k2.6, nanogpt:qwen25-vl-72b-instruct, nanogpt:z-ai/glm-4.6v]
 
 # 每百万 token (input, output) USD. 0 = 订阅制/免费.
 # 厂商改价或换计费模式时, 改这里, llm_audit 表里 cost_usd 自动跟着变.
@@ -56,6 +91,8 @@ costs:
   "ollama:qwen3-coder-next":    [0.0, 0.0]
   "ollama:qwen3-vl:235b":       [0.0, 0.0]
   "gemini:gemini-embedding-001": [0.0, 0.0]
+  # nanogpt:* 刻意不列 —— 它在每次响应的 usage.cost 里自报真实花费,
+  # llm_router 优先用实报值。写死价格表只会和实际对不上 (模型 294 个且会变价)。
 
 embeddings:
   default: gemini:gemini-embedding-001

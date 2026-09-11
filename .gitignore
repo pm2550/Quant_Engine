@@ -71,3 +71,7 @@ data/edgar/
 
 # 已废弃配置的备份 (2026-06-02 dashscope 下线)
 config/llm.yaml.bak-*
+
+# 配置文件的时间戳备份 (本地回滚用, 不进仓库)
+config/*.yaml.bak-*
+config/*.bak-*
